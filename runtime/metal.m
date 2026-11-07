@@ -3,7 +3,15 @@
  * On macOS the window must be on the MAIN thread. Since the guest already runs
  * on a separate thread this fits: the main thread drives the NSApplication loop,
  * the guest thread writes draw commands into a queue.                    */
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+/* iOS (ios branch): no AppKit.  UIApplicationMain owns the main thread
+ * (runtime/ios_app.m); metal_run_main_loop runs on the boot thread and gets
+ * its CAMetalLayer from the app's view (metal_ios_attach_layer). */
+#import <UIKit/UIKit.h>
+#else
 #import <Cocoa/Cocoa.h>
+#endif
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/QuartzCore.h>
 
@@ -25,11 +33,18 @@
 #include <time.h>
 #include <stdlib.h>
 
+#if !TARGET_OS_IPHONE
 static NSWindow        *g_win;
-#import <ImageIO/ImageIO.h>
 #import <CoreServices/CoreServices.h>
+#endif
+#import <ImageIO/ImageIO.h>
 
 static CAMetalLayer    *g_layer;
+#if TARGET_OS_IPHONE
+static _Atomic int      g_ios_paused;
+void metal_ios_attach_layer(CAMetalLayer *l){ g_layer = l; }
+void metal_ios_set_paused(int p){ atomic_store(&g_ios_paused, p ? 1 : 0); }
+#endif
 static long             g_skip_empty;   /* a frame with no content: don't present */
 static id<MTLTexture>   g_capture;   /* readable copy for frame capture */
 
@@ -281,6 +296,22 @@ int metal_take_char(int remove){
 /* The character(s) a key press produces.  The game uses single-byte
  * Windows-1252: U+00A0..U+00FF are the same values; letters specific to Turkish
  * aren't in 1252 and are folded to their nearest ASCII equivalent. */
+#if TARGET_OS_IPHONE
+/* iOS input entry points (runtime/ios_app.m, main thread).  Touch = absolute
+ * cursor + left button; on-screen buttons and hardware keys = DIK scan codes. */
+void metal_ios_key(unsigned char dik, int down){ atomic_store(&g_keys[dik], down ? 1 : 0); }
+void metal_ios_char(unsigned char ch){ char_push(ch); }
+static void mouse_from_point(double px, double py, int *gx, int *gy);
+void metal_ios_touch(double px, double py, int phase){   /* points, top-left origin; 0 down 1 move 2 up */
+    int nx, ny;
+    /* mouse_from_point flips Y (AppKit bottom-left): pass the flipped value */
+    mouse_from_point(px, (double)atomic_load(&g_cont_h) - py, &nx, &ny);
+    int ox = atomic_exchange(&g_mouse_x, nx), oy = atomic_exchange(&g_mouse_y, ny);
+    if (phase == 1){ atomic_fetch_add(&g_mouse_dx, nx - ox); atomic_fetch_add(&g_mouse_dy, ny - oy); }
+    if (phase == 0) atomic_fetch_or(&g_mouse_btn, 1u);
+    if (phase == 2) atomic_fetch_and(&g_mouse_btn, ~1u);
+}
+#else
 static void char_from_event(NSEvent *ev){
     switch ([ev keyCode]){
     case 0x24: case 0x4C: char_push(0x0D); return;   /* Return / Enter */
@@ -303,6 +334,7 @@ static void char_from_event(NSEvent *ev){
             char_push((unsigned char)u);
     }
 }
+#endif /* !TARGET_OS_IPHONE */
 /* AUTOTEXT="<frame>:<text>": "types" the text from that frame on, one letter
  * every 6 frames (diagnostic/test).  \n -> Enter (0x0D), \b -> Backspace. */
 static void autotext_tick(long f){
@@ -1185,6 +1217,7 @@ static _Atomic long     g_rtfree_at = 0;      /* release after this frame */
 static unsigned long    g_rt_freed = 0;
 static uint8_t          g_tex_freed[MAXTEX];      /* diagnostic: released */
 static unsigned short   g_freed_w[MAXTEX], g_freed_h[MAXTEX];
+static _Atomic long long g_tex_bytes;        /* live Metal texture memory (see TEXTURE MEMORY) */
 static unsigned long    g_freed_use_smp = 0, g_freed_use_tgt = 0;
 static void freed_use(unsigned id_, int as_tgt){
     if (id_ >= MAXTEX || !g_tex_freed[id_]) return;
@@ -1209,6 +1242,117 @@ static MTLPixelFormat d3dfmt_to_mtl(unsigned f, unsigned *blk, unsigned *bpb){
     default: *blk=0; *bpb=0; return MTLPixelFormatInvalid;
     }
 }
+
+#if TARGET_OS_IPHONE
+/* --- iOS / A7: no BC sampling ----------------------------------------------
+ * d3dfmt_to_mtl keeps describing the GUEST layout (pitch/rows the game locks);
+ * the Metal texture of a DXT texture is BGRA8 and every upload is decoded on the
+ * CPU (dxt_decode).  Memory: DXT1 x8, DXT3/5 x4, so mipmapped textures bigger
+ * than NFSU2_TEXMAXDIM (default 512) drop their top levels (g_tex_drop): the
+ * game renders at 1024x768 on a 7.9" screen, the top level of a 1024 texture is
+ * rarely sampled.  Single-level textures and render targets keep full size. */
+static uint8_t  g_tex_bc[65536];       /* 1 DXT1, 3 DXT3, 5 DXT5; 0 native (indexed by id, MAXTEX) */
+static uint8_t  g_tex_drop[65536];     /* top levels dropped */
+static unsigned tex_maxdim(void){
+    static unsigned v; if (!v){ const char *e = getenv("NFSU2_TEXMAXDIM");
+        v = (e && atoi(e) >= 16) ? (unsigned)atoi(e) : 512u; } return v; }
+static int ios_bc_kind(unsigned f){
+    return f == 0x31545844 ? 1 : f == 0x33545844 ? 3 : f == 0x35545844 ? 5 : 0; }
+static inline void c565(unsigned c, uint8_t *o){          /* -> B,G,R */
+    unsigned r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+    o[2] = (uint8_t)((r << 3) | (r >> 2)); o[1] = (uint8_t)((g << 2) | (g >> 4)); o[0] = (uint8_t)((b << 3) | (b >> 2)); }
+/* Decode a w x h level (guest DXT layout, src pitch spitch per block row) to BGRA8 dst (w*4 per row). */
+/* DXT1 -> 16-bit MTLPixelFormatBGR5A1Unorm (B bits 0-4, G 5-9, R 10-14, A bit 15):
+ * half the memory of BGRA8, keeps DXT1's 1-bit punch-through alpha; the colour loses
+ * one bit of green (DXT1 endpoints are 5:6:5 anyway).  NFSU2_DXT1_16=0 -> BGRA8. */
+static int dxt1_16(void){
+    static int v = -1;
+    if (v < 0){ const char *e = getenv("NFSU2_DXT1_16"); v = !(e && *e == '0'); }
+    return v;
+}
+static void dxt1_decode16(const uint8_t *src, unsigned spitch, unsigned w, unsigned h, uint16_t *dst){
+    unsigned bw = (w + 3) / 4, bh = (h + 3) / 4;
+    for (unsigned by = 0; by < bh; by++){
+        const uint8_t *row = src + (size_t)by * spitch;
+        for (unsigned bx = 0; bx < bw; bx++){
+            const uint8_t *b = row + bx * 8u;
+            unsigned c0 = b[0] | (b[1] << 8), c1 = b[2] | (b[3] << 8);
+            int r[4], g[4], bl[4]; uint16_t pal[4];
+            r[0] = (c0 >> 11) & 31; g[0] = (c0 >> 5) & 63; bl[0] = c0 & 31;
+            r[1] = (c1 >> 11) & 31; g[1] = (c1 >> 5) & 63; bl[1] = c1 & 31;
+            int transp = 0;
+            if (c0 > c1){
+                r[2] = (2*r[0] + r[1] + 1) / 3; g[2] = (2*g[0] + g[1] + 1) / 3; bl[2] = (2*bl[0] + bl[1] + 1) / 3;
+                r[3] = (r[0] + 2*r[1] + 1) / 3; g[3] = (g[0] + 2*g[1] + 1) / 3; bl[3] = (bl[0] + 2*bl[1] + 1) / 3;
+            } else {
+                r[2] = (r[0] + r[1]) / 2; g[2] = (g[0] + g[1]) / 2; bl[2] = (bl[0] + bl[1]) / 2;
+                r[3] = g[3] = bl[3] = 0; transp = 1;
+            }
+            for (int k = 0; k < 4; k++)
+                pal[k] = (uint16_t)((bl[k] & 31) | (((g[k] >> 1) & 31) << 5) | ((r[k] & 31) << 10) |
+                                    ((k == 3 && transp) ? 0 : 0x8000));
+            uint32_t idx = b[4] | (b[5] << 8) | (b[6] << 16) | ((uint32_t)b[7] << 24);
+            for (unsigned py = 0; py < 4; py++){
+                unsigned y = by * 4 + py; if (y >= h) break;
+                uint16_t *o = dst + (size_t)y * w + bx * 4;
+                for (unsigned px = 0; px < 4; px++){
+                    if (bx * 4 + px >= w) break;
+                    o[px] = pal[(idx >> (2 * (py * 4 + px))) & 3];
+                }
+            }
+        }
+    }
+}
+/* live texture bytes by kind (iOS): 0 native, 1 DXT1, 3 DXT3, 5 DXT5 */
+static _Atomic long long g_texk_bytes[6];
+long long metal_tex_kind_bytes(int k){ return (k >= 0 && k < 6) ? atomic_load(&g_texk_bytes[k]) : 0; }
+static void dxt_decode(int kind, const uint8_t *src, unsigned spitch, unsigned w, unsigned h, uint8_t *dst){
+    unsigned bw = (w + 3) / 4, bh = (h + 3) / 4;
+    for (unsigned by = 0; by < bh; by++){
+        const uint8_t *row = src + (size_t)by * spitch;
+        for (unsigned bx = 0; bx < bw; bx++){
+            const uint8_t *b = row + bx * (kind == 1 ? 8u : 16u);
+            const uint8_t *cb = kind == 1 ? b : b + 8;
+            uint8_t pal[4][4];
+            unsigned c0 = cb[0] | (cb[1] << 8), c1 = cb[2] | (cb[3] << 8);
+            c565(c0, pal[0]); c565(c1, pal[1]); pal[0][3] = pal[1][3] = 255;
+            if (kind != 1 || c0 > c1){
+                for (int k = 0; k < 3; k++){
+                    pal[2][k] = (uint8_t)((2 * pal[0][k] + pal[1][k] + 1) / 3);
+                    pal[3][k] = (uint8_t)((pal[0][k] + 2 * pal[1][k] + 1) / 3); }
+                pal[2][3] = pal[3][3] = 255;
+            } else {
+                for (int k = 0; k < 3; k++){ pal[2][k] = (uint8_t)((pal[0][k] + pal[1][k]) / 2); pal[3][k] = 0; }
+                pal[2][3] = 255; pal[3][3] = 0;
+            }
+            uint32_t idx = cb[4] | (cb[5] << 8) | (cb[6] << 16) | ((uint32_t)cb[7] << 24);
+            uint8_t al[16];
+            if (kind == 3){
+                for (int i = 0; i < 16; i++){ unsigned a = (b[i >> 1] >> ((i & 1) * 4)) & 15; al[i] = (uint8_t)(a * 17); }
+            } else if (kind == 5){
+                unsigned a0 = b[0], a1 = b[1]; uint8_t ap[8]; ap[0] = (uint8_t)a0; ap[1] = (uint8_t)a1;
+                if (a0 > a1) for (int i = 1; i < 7; i++) ap[i + 1] = (uint8_t)(((7 - i) * a0 + i * a1 + 3) / 7);
+                else { for (int i = 1; i < 5; i++) ap[i + 1] = (uint8_t)(((5 - i) * a0 + i * a1 + 2) / 5);
+                       ap[6] = 0; ap[7] = 255; }
+                uint64_t bits = 0; for (int i = 0; i < 6; i++) bits |= (uint64_t)b[2 + i] << (8 * i);
+                for (int i = 0; i < 16; i++) al[i] = ap[(bits >> (3 * i)) & 7];
+            }
+            for (unsigned py = 0; py < 4; py++){
+                unsigned y = by * 4 + py; if (y >= h) break;
+                uint8_t *o = dst + ((size_t)y * w + bx * 4) * 4;
+                for (unsigned px = 0; px < 4; px++){
+                    if (bx * 4 + px >= w) break;
+                    unsigned i = py * 4 + px;
+                    const uint8_t *c = pal[(idx >> (2 * i)) & 3];
+                    o[0] = c[0]; o[1] = c[1]; o[2] = c[2];
+                    o[3] = kind == 1 ? c[3] : al[i];
+                    o += 4;
+                }
+            }
+        }
+    }
+}
+#endif
 
 /* Ids are never reused (the COM objects have no refcount): when the table is full every
  * later texture is "no texture" = white.  Say so once instead of failing silently. */
@@ -1260,6 +1404,15 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
     MTLPixelFormat pf = d3dfmt_to_mtl(d3dfmt, &blk, &bpb);
     if (pf == MTLPixelFormatInvalid) return 0;
     if (!levels) levels = 1;
+#if TARGET_OS_IPHONE
+    int bck = ios_bc_kind(d3dfmt);
+    if (bck){ pf = MTLPixelFormatBGRA8Unorm; blk = 1; bpb = 4; }
+    if (bck == 1 && dxt1_16()){ pf = MTLPixelFormatBGR5A1Unorm; bpb = 2; }
+    unsigned drop = 0;
+    if (!is_rt) while (drop + 1 < levels && ((w >> drop) > tex_maxdim() || (h >> drop) > tex_maxdim())) drop++;
+    w >>= drop; h >>= drop; levels -= drop;
+    if (!w) w = 1; if (!h) h = 1;
+#endif
     MTLTextureDescriptor *td =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
                               width:w height:h mipmapped:(levels > 1)];
@@ -1267,12 +1420,20 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
     td.usage = MTLTextureUsageShaderRead | (is_rt ? MTLTextureUsageRenderTarget : 0);
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [g_dev newTextureWithDescriptor:td];
-    if (!t) return 0;
+    if (!t){ static int nf; if (nf++ < 20)
+                 fprintf(stderr, "metal: newTexture FAILED %ux%u levels %u pf %lu rt %u (live textures %lld MB)\n",
+                         w, h, levels, (unsigned long)pf, is_rt, atomic_load(&g_tex_bytes) >> 20);
+             return 0; }
+    atomic_fetch_add(&g_tex_bytes, (long long)t.allocatedSize);
     /* New texture content is undefined; clear to transparent black so textures that
      * weren't uploaded don't show up as garbage on screen (example: render targets). */
     tex_zero_all(t, w, h, levels, 1, blk, bpb);
     unsigned id_ = g_texn++;
     g_tex[id_] = t;
+#if TARGET_OS_IPHONE
+    g_tex_bc[id_] = (uint8_t)bck; g_tex_drop[id_] = (uint8_t)drop;
+    atomic_fetch_add(&g_texk_bytes[bck], (long long)t.allocatedSize);
+#endif
     g_tex_isrt[id_] = is_rt ? 1 : 0;
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
@@ -1289,9 +1450,68 @@ static void rt_free_pending(void){
     if (upto <= g_rtfree_done || atomic_load(&g_frames_drawn) < atomic_load(&g_rtfree_at)) return;
     for (unsigned i = g_rtfree_done; i < upto && i < MAXTEX; i++)
         if (g_tex_isrt[i] && g_tex[i]){
+            atomic_fetch_sub(&g_tex_bytes, (long long)g_tex[i].allocatedSize);
+#if TARGET_OS_IPHONE
+            atomic_fetch_sub(&g_texk_bytes[g_tex_bc[i] < 6 ? g_tex_bc[i] : 0], (long long)g_tex[i].allocatedSize);
+#endif
             g_freed_w[i] = (unsigned short)g_tex[i].width; g_freed_h[i] = (unsigned short)g_tex[i].height;
             g_tex[i] = nil; g_tex_isrt[i] = 0; g_tex_freed[i] = 1; g_rt_freed++; }
     g_rtfree_done = upto;
+}
+
+/* --- TEXTURE MEMORY: accounting + free on the guest's last Release ------------
+ * Upstream never freed Metal textures (ids aren't reused; 2,158 of 2,170 still
+ * alive at the end of a Mac race, 123 MB as BC).  On the iPad (1 GB, DXT decoded
+ * to BGRA8) the menu textures plus the race textures don't fit: texture creation
+ * started failing while the race loaded.  com.c's refcount already finds the last
+ * Release (obj_release); the texture is queued here and dropped by the render
+ * thread after a quarantine (NFSU2_TEXQUAR presented frames, default 300 ~ 5 s:
+ * the game is known to touch released data for a while, see GBUF_QUAR in com.c).
+ * NFSU2_TEXFREE=0 keeps the old behaviour.  Default: on for iOS, off for macOS. */
+static unsigned long g_tex_rel_n, g_tex_rel_freed;
+long long metal_tex_bytes(void){ return atomic_load(&g_tex_bytes); }
+#define TQN 16384u
+static struct { unsigned id; long at; } g_tq[TQN];
+static unsigned g_tq_w, g_tq_r;
+static pthread_mutex_t g_tq_lock = PTHREAD_MUTEX_INITIALIZER;
+static int texfree_on(void){
+    static int v = -1;
+    if (v < 0){ const char *e = getenv("NFSU2_TEXFREE");
+#if TARGET_OS_IPHONE
+        v = !(e && *e == '0');
+#else
+        v = (e && *e == '1');
+#endif
+    }
+    return v;
+}
+void metal_tex_release(unsigned id_){
+    if (!id_ || id_ >= MAXTEX || !texfree_on()) return;
+    static long quar = -1;
+    if (quar < 0){ const char *e = getenv("NFSU2_TEXQUAR"); quar = (e && *e) ? atol(e) : 300; }
+    pthread_mutex_lock(&g_tq_lock);
+    if (g_tq_w - g_tq_r < TQN){
+        g_tq[g_tq_w % TQN].id = id_; g_tq[g_tq_w % TQN].at = atomic_load(&g_frames_drawn) + quar;
+        g_tq_w++; g_tex_rel_n++;
+    }
+    pthread_mutex_unlock(&g_tq_lock);
+}
+/* Main/render thread, end of frame. */
+static void tex_free_pending(void){
+    long now = atomic_load(&g_frames_drawn);
+    pthread_mutex_lock(&g_tq_lock);
+    while (g_tq_r != g_tq_w && g_tq[g_tq_r % TQN].at <= now){
+        unsigned i = g_tq[g_tq_r % TQN].id; g_tq_r++;
+        if (g_tex[i]){
+            atomic_fetch_sub(&g_tex_bytes, (long long)g_tex[i].allocatedSize);
+#if TARGET_OS_IPHONE
+            atomic_fetch_sub(&g_texk_bytes[g_tex_bc[i] < 6 ? g_tex_bc[i] : 0], (long long)g_tex[i].allocatedSize);
+#endif
+            g_freed_w[i] = (unsigned short)g_tex[i].width; g_freed_h[i] = (unsigned short)g_tex[i].height;
+            g_tex[i] = nil; g_tex_isrt[i] = 0; g_tex_freed[i] = 1; g_tex_rel_freed++;
+        }
+    }
+    pthread_mutex_unlock(&g_tq_lock);
 }
 
 #if NFS_ENHANCED
@@ -3754,6 +3974,11 @@ unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
     MTLPixelFormat pf = d3dfmt_to_mtl(d3dfmt, &blk, &bpb);
     if (pf == MTLPixelFormatInvalid) return 0;
     if (!levels) levels = 1;
+#if TARGET_OS_IPHONE
+    int bck = ios_bc_kind(d3dfmt);
+    if (bck){ pf = MTLPixelFormatBGRA8Unorm; blk = 1; bpb = 4; }
+    if (bck == 1 && dxt1_16()){ pf = MTLPixelFormatBGR5A1Unorm; bpb = 2; }
+#endif
     MTLTextureDescriptor *td =
         [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pf
                               size:edge mipmapped:(levels > 1)];
@@ -3764,10 +3989,16 @@ unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
      * _validateReplaceRegion assert, crash at frame 9). */
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [g_dev newTextureWithDescriptor:td];
-    if (!t) return 0;
+    if (!t){ fprintf(stderr, "metal: newTexture (cube %u) FAILED (live textures %lld MB)\n", edge,
+                     atomic_load(&g_tex_bytes) >> 20); return 0; }
+    atomic_fetch_add(&g_tex_bytes, (long long)t.allocatedSize);
     tex_zero_all(t, edge, edge, levels, 6, blk, bpb);
     unsigned id_ = g_texn++;
     g_tex[id_] = t;
+#if TARGET_OS_IPHONE
+    g_tex_bc[id_] = (uint8_t)bck; g_tex_drop[id_] = 0;
+    atomic_fetch_add(&g_texk_bytes[bck], (long long)t.allocatedSize);
+#endif
     g_tex_cube[id_] = 1;
     g_tex_isrt[id_] = is_rt ? 1 : 0;
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
@@ -3787,6 +4018,27 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
     if (d3dfmt_to_mtl(d3dfmt, &blk, &bpb) == MTLPixelFormatInvalid) return;
     unsigned lw = w >> level, lh = h >> level;
     if (!lw) lw = 1; if (!lh) lh = 1;
+#if TARGET_OS_IPHONE
+    /* see "iOS / A7: no BC sampling": dropped top levels, CPU DXT decode */
+    if (g_tex_drop[id_]){
+        if (level < g_tex_drop[id_]){ atomic_fetch_add(&g_tex_uploaded, 1); return; }
+        level -= g_tex_drop[id_];
+    }
+    static uint8_t *dec; static size_t decsz;
+    static pthread_mutex_t declock = PTHREAD_MUTEX_INITIALIZER;
+    int bck = g_tex_bc[id_];
+    if (bck){
+        pthread_mutex_lock(&declock);
+        int d16 = (g_tex[id_].pixelFormat == MTLPixelFormatBGR5A1Unorm);
+        size_t need = (size_t)lw * lh * (d16 ? 2 : 4);
+        if (need > decsz){ free(dec); dec = malloc(need); decsz = dec ? need : 0; }
+        if (!dec){ pthread_mutex_unlock(&declock); return; }
+        if (d16){ dxt1_decode16((const uint8_t *)data, pitch, lw, lh, (uint16_t *)dec);
+                  data = dec; pitch = lw * 2; blk = 1; bpb = 2; }
+        else { dxt_decode(bck, (const uint8_t *)data, pitch, lw, lh, dec);
+               data = dec; pitch = lw * 4; blk = 1; bpb = 4; }
+    }
+#endif
     MTLRegion rg = MTLRegionMake2D(0, 0, lw, lh);
     struct timespec _u0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_u0);
     /* see ORDERED TEXTURE UPLOADS: second and later uploads go into the draw list */
@@ -3822,6 +4074,9 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
                       (uint64_t)pitch * (blk == 1 ? lh : (lh + blk - 1) / blk)); }
     if (level < 16u) g_tex_lvlmask[id_] |= 1u << level;
     atomic_fetch_add(&g_tex_uploaded, 1);
+#if TARGET_OS_IPHONE
+    if (bck) pthread_mutex_unlock(&declock);
+#endif
 }
 void metal_upload_texture(unsigned id_, unsigned level, const void *data,
                           unsigned pitch, unsigned w, unsigned h, unsigned d3dfmt){
@@ -4049,8 +4304,10 @@ static unsigned u_gcd(unsigned a, unsigned b){
 }
 /* The window style in ONE place: if the usable area calculation doesn't use the
  * same style as the window itself the title bar margin doesn't match. */
+#if !TARGET_OS_IPHONE
 #define NFSU_WIN_STYLE (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | \
                         NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+#endif
 /* The screen's usable CONTENT area (points) and scale.  Measured with AppKit on
  * the main thread and stored.  A guess was NOT ENOUGH: the title bar was assumed
  * to be 28 points, on a notched screen it was 32; the 3-point difference clipped
@@ -4105,6 +4362,16 @@ static void fbonly_copy(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTextu
     [en endEncoding];
 }
 static _Atomic int g_scr_cw = 0, g_scr_ch = 0, g_scr_s100 = 0;
+#if TARGET_OS_IPHONE
+/* iOS: the app delegate measures the screen on the main thread before the boot
+ * thread starts (landscape points + scale) and stores it here. */
+void metal_ios_set_screen(int wpt, int hpt, double scale){
+    atomic_store(&g_scr_cw, wpt); atomic_store(&g_scr_ch, hpt);
+    atomic_store(&g_scr_s100, (int)lround(scale * 100.0));
+    atomic_store(&g_cont_w, wpt); atomic_store(&g_cont_h, hpt);
+}
+static void scr_cache(void){ }
+#else
 static void scr_cache(void){
     @autoreleasepool {
         NSScreen *sc = [NSScreen mainScreen];
@@ -4116,6 +4383,7 @@ static void scr_cache(void){
         atomic_store(&g_scr_s100, (int)lround([sc backingScaleFactor] * 100.0));
     }
 }
+#endif
 void metal_native_size(unsigned gw, unsigned gh, unsigned *ow, unsigned *oh){
     if (!ow || !oh) return;
     *ow = gw; *oh = gh;
@@ -4138,6 +4406,9 @@ void metal_native_size(unsigned gw, unsigned gh, unsigned *ow, unsigned *oh){
         /* exactly the same limit win_apply_size will apply */
         aw = cw; ah = ch; s = s100 / 100.0;
     } else {
+#if TARGET_OS_IPHONE
+        return;
+#else
         /* Without the cache, a CoreGraphics estimate (thread-safe). */
         CGDirectDisplayID d = CGMainDisplayID();
         CGRect b = CGDisplayBounds(d);                /* in POINTS */
@@ -4148,6 +4419,7 @@ void metal_native_size(unsigned gw, unsigned gh, unsigned *ow, unsigned *oh){
                 CGDisplayModeRelease(m); }
         /* menu bar / notch (<=32) + title bar (<=32) */
         aw = b.size.width; ah = b.size.height - 64.0;
+#endif
     }
     if (s < 1.0) s = 1.0;
     if (aw < 320.0 || ah < 240.0) return;
@@ -4206,7 +4478,11 @@ static id<MTLSamplerState> samp_for(unsigned k){
     MTLSamplerAddressMode am[6] = { MTLSamplerAddressModeRepeat,
         MTLSamplerAddressModeRepeat, MTLSamplerAddressModeMirrorRepeat,
         MTLSamplerAddressModeClampToEdge, MTLSamplerAddressModeClampToZero,
+#if TARGET_OS_IPHONE
+        MTLSamplerAddressModeMirrorRepeat };   /* mirror-clamp is iOS 14+ (not on A7 / iOS 12) */
+#else
         MTLSamplerAddressModeMirrorClampToEdge };
+#endif
     sd.sAddressMode = am[au < 6u ? au : 1u];
     sd.tAddressMode = am[av < 6u ? av : 1u];
     id<MTLSamplerState> st = [g_dev newSamplerStateWithDescriptor:sd];
@@ -4233,6 +4509,16 @@ static id<MTLSamplerState> samp_for(unsigned k){
  * same on Windows.)  Since the settings menu rows are generated from the window's
  * ratio there are normally no bars (see com.c modes_refresh). */
 static _Atomic int g_win_sized = 0;
+#if TARGET_OS_IPHONE
+/* iOS: the layer fills the screen (aspect fit); the drawable is the game's size. */
+static void win_apply_size(unsigned w, unsigned h){
+    if (!g_layer) return;
+    g_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
+    atomic_store(&g_draw_w, (int)w); atomic_store(&g_draw_h, (int)h);
+    fprintf(stderr, "metal: screen: drawing %ux%u pixels, view %dx%d points\n",
+            w, h, atomic_load(&g_cont_w), atomic_load(&g_cont_h));
+}
+#else
 static void win_apply_size(unsigned w, unsigned h){
     if (!g_layer) return;
     CGFloat s = g_win ? [g_win backingScaleFactor]
@@ -4258,6 +4544,7 @@ static void win_apply_size(unsigned w, unsigned h){
             fs ? "fullscreen" : "window", w, h, (double)c.width, (double)c.height, (double)s,
             exact ? "1:1" : "scaled to the window");
 }
+#endif
 /* The VIEW (pixels) the settings menu rows are based on: in fullscreen the
  * fullscreen content, in a window the window's current content; if the window
  * isn't sized yet, the size it will get on first launch.  Called from the guest
@@ -4962,8 +5249,11 @@ void metal_early_init(void){
     /* Measure the screen geometry BEFORE the guest thread starts, on the main thread:
      * the guest picks the drawing size from it in CreateDevice (boot.c calls this
      * function before pthread_create). */
+#if !TARGET_OS_IPHONE
     [NSApplication sharedApplication];
+#endif
     scr_cache();
+#if !TARGET_OS_IPHONE
     /* App Nap / timer coalescing OFF.  When the game window isn't in the
      * foreground macOS drops the process to background QoS and the work moves
      * to the EFFICIENCY cores -- measured: same binary, same scene, 36 ms/frame
@@ -4974,6 +5264,7 @@ void metal_early_init(void){
                  NSActivityUserInitiated | NSActivityLatencyCritical
                  reason:@"game frame production"];
       (void)act; }
+#endif
     dump_init();
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev){ fprintf(stderr, "metal: device not found\n"); return; }
@@ -5152,6 +5443,28 @@ static MTLBlendOperation d3d_blendop(unsigned op){
     }
 }
 
+/* Indexed draw from the pool.  macOS: baseVertex.  iOS: the A7 (GPU family 1) has
+ * no base vertex ('APINotSupported' exception), so the base is folded into the vertex
+ * buffer offset: the VS fetches VB + vid * K.stride, K.stride = first word of the
+ * draw's constant block (g_kbuf). */
+static void draw_ix_enc(id<MTLRenderCommandEncoder> enc, int rb, const MDraw *dr, id<MTLBuffer> pl){
+#if TARGET_OS_IPHONE
+    unsigned st; memcpy(&st, g_kbuf[rb] + dr->koff, 4);
+    int64_t off = (int64_t)dr->rawoff + (int64_t)dr->ix_base * (int64_t)st;
+    if (off < 0) return;
+    [enc setVertexBuffer:pl offset:(NSUInteger)off atIndex:1];
+    [enc setVertexBuffer:g_mtlkb offset:dr->koff atIndex:2];
+    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:dr->count
+                     indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                   indexBuffer:pl indexBufferOffset:dr->ix_ib];
+#else
+    [enc setVertexBuffer:pl offset:dr->rawoff atIndex:1];
+    [enc setVertexBuffer:g_mtlkb offset:dr->koff atIndex:2];
+    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:dr->count
+                     indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                   indexBuffer:pl indexBufferOffset:dr->ix_ib instanceCount:1 baseVertex:dr->ix_base baseInstance:0];
+#endif
+}
 static id<MTLRenderPipelineState> pso_for(uint64_t key){
     for (unsigned i = 0; i < g_pson; i++)
         if (g_psocache[i].key == key) return g_psocache[i].pso;
@@ -5584,6 +5897,7 @@ static void dump_one_texture(unsigned id_, long frame){
 /* The game draws its own cursor; if the macOS cursor is also visible there are
  * two cursors on screen.  Hide the system cursor while in the game area, bring it
  * back on leaving. */
+#if !TARGET_OS_IPHONE
 static int g_cur_hidden = 0;
 static void cursor_hide_update(int inside){
     if (inside && !g_cur_hidden){ [NSCursor hide];   g_cur_hidden = 1; }
@@ -5826,6 +6140,13 @@ static void ks_engel(int on){
     (void)s; fprintf(stderr, "app: quit request (Cmd-Q / Dock)\n");
     atomic_store(&g_should_quit, 1); return NSTerminateCancel; }
 @end
+#else /* TARGET_OS_IPHONE: no cursor, display-link probe, fullscreen pref or shortcut guard */
+static void cursor_hide_update(int inside){ (void)inside; }
+static int g_ks_fd = -1;
+static int ks_wanted(void){ return 0; }
+static void ks_engel(int on){ (void)on; }
+int metal_kisayol_bekci(void){ return 0; }
+#endif
 
 #if NFS_ENHANCED
 /* ---- SEPARATE G PASS ----------------------------------------------------------
@@ -5918,12 +6239,7 @@ static void hd_gpass(id<MTLCommandBuffer> cb, int rb, unsigned upto, unsigned zi
           for (int q4 = 0; q4 < 4; q4++){ unsigned tt = ts[q4];
               [e setFragmentTexture:(tt && tt < MAXTEX && g_tex[tt]) ? g_tex[tt] : g_white atIndex:(NSUInteger)q4]; } }
         if (dr->vsid > 0 && dr->ix_isz){
-            id<MTLBuffer> pl = g_pool_fr[rb];
-            [e setVertexBuffer:pl offset:dr->rawoff atIndex:1];
-            [e setVertexBuffer:g_mtlkb offset:dr->koff atIndex:2];
-            [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:dr->count
-                           indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
-                         indexBuffer:pl indexBufferOffset:dr->ix_ib instanceCount:1 baseVertex:dr->ix_base baseInstance:0];
+            draw_ix_enc(e, rb, dr, g_pool_fr[rb]);
         } else if (dr->vsid > 0){
             float u4[4] = { dr->uvbm ? dr->uvb[0] : 0.f, dr->uvbm ? dr->uvb[1] : 0.f, 0, 0 };
             [e setVertexBytes:u4 length:sizeof u4 atIndex:3];
@@ -5945,6 +6261,18 @@ void metal_run_main_loop(void){
         metal_early_init();
         if (!g_dev) return;
 
+#if TARGET_OS_IPHONE
+        /* The layer comes from the app's view (metal_ios_attach_layer, called on
+         * the main thread before the boot thread starts). */
+        if (!g_layer){ fprintf(stderr, "metal: no layer attached\n"); return; }
+        g_layer.device = g_dev;
+        g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        g_layer.framebufferOnly = NO;     /* the game copies from the back buffer */
+        g_layer.opaque = YES;
+        g_layer.contentsGravity = kCAGravityResizeAspect;
+        unsigned rw = g_want_w ? g_want_w : 1024u, rh = g_want_h ? g_want_h : 768u;
+        win_apply_size(rw, rh);
+#else
         [NSApplication sharedApplication];
         /* NOFOCUS=1 (test runs): no Dock icon, doesn't steal focus; the window opens
          * in the background.  The user's keyboard doesn't go to the test window. */
@@ -6050,6 +6378,7 @@ void metal_run_main_loop(void){
         else { [g_win makeKeyAndOrderFront:nil];
                [NSApp activateIgnoringOtherApps:YES]; }
         if (fs_pref_load()) [g_win toggleFullScreen:nil];
+#endif /* !TARGET_OS_IPHONE: window setup */
 
         /* draw resources were set up in metal_early_init() */
 #ifndef NFS_VERSION
@@ -6070,6 +6399,13 @@ void metal_run_main_loop(void){
             if (quitat && atomic_load(&g_frames_drawn) >= quitat){
                 atomic_store(&g_should_quit, 1); break; }
             rt_free_pending();
+            tex_free_pending();
+#if TARGET_OS_IPHONE
+            /* app in the background: iOS forbids GPU work; hold the loop (the guest
+             * stalls on the full frame queue, i.e. the game pauses) */
+            while (atomic_load(&g_ios_paused) && !atomic_load(&g_should_quit)) usleep(50000);
+#endif
+#if !TARGET_OS_IPHONE
             /* FSFAKE=<frame>[,...]: simulate the fullscreen transition from the GAME's point of
              * view without touching the window (view = screen size, device lost);
              * real fullscreen isn't reliable in the background (test). */
@@ -6134,10 +6470,12 @@ void metal_run_main_loop(void){
              * at most n frames a second. */
             { static int bg = -2; if (bg == -2){ const char *e = ENVC("BGFPS"); bg = e ? atoi(e) : 0; }
               if (bg > 0 && ![NSApp isActive]) usleep((useconds_t)(1000000 / bg)); }
+#endif /* !TARGET_OS_IPHONE: window test hooks */
             /* FPSCAP=<n> (test): at most n frames a second, always */
             { static int cap = -2; if (cap == -2){ const char *e = ENVC("FPSCAP"); cap = e ? atoi(e) : 0; }
               if (cap > 0) usleep((useconds_t)(1000000 / cap)); }
             @autoreleasepool {
+#if !TARGET_OS_IPHONE
                 NSEvent *ev;
                 while ((ev = [NSApp nextEventMatchingMask:NSEventMaskAny
                                                 untilDate:nil
@@ -6222,6 +6560,7 @@ void metal_run_main_loop(void){
                  * never responds to Quit. */
                 [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
                                          beforeDate:[NSDate distantPast]];
+#endif /* !TARGET_OS_IPHONE: event pump */
 
                 /* AUTOKEY=<vk>[,<vk>...]: periodic synthetic key presses to measure whether
                  * the game reacts to input. */
@@ -7440,13 +7779,7 @@ void metal_run_main_loop(void){
                                   } }
                                 atomic_fetch_add(&g_draw_n, 1ull);
                                 if (dr->vsid > 0 && dr->ix_isz){
-                                    id<MTLBuffer> pl = g_pool_fr[rb];
-                                    [enc setVertexBuffer:pl offset:dr->rawoff atIndex:1];
-                                    [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
-                                    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:dr->count
-                                                     indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
-                                                   indexBuffer:pl indexBufferOffset:dr->ix_ib
-                                                 instanceCount:1 baseVertex:dr->ix_base baseInstance:0];
+                                    draw_ix_enc(enc, rb, dr, g_pool_fr[rb]);
                                 } else if (dr->vsid > 0){
                                     if (dr->uvbm && (dr->uvb[0] != c_uvb[0] || dr->uvb[1] != c_uvb[1])){
                                         float u4[4] = { dr->uvb[0], dr->uvb[1], 0, 0 };
@@ -7656,6 +7989,8 @@ void metal_run_main_loop(void){
           fprintf(stderr, "metal: encoding exceeded 60 ms (used to swap into the buffer being encoded): %lu times", n);
           for (unsigned long q = 0; q < n && q < 8; q++) fprintf(stderr, "%s%ld", q ? "," : "  kareler: ", g_enc_late_f[q]);
           fprintf(stderr, "\n"); }
+        fprintf(stderr, "metal: textures released by the game: %lu queued, %lu freed (%s), live %lld MB\n",
+                g_tex_rel_n, g_tex_rel_freed, texfree_on() ? "on" : "off", atomic_load(&g_tex_bytes) >> 20);
         fprintf(stderr, "metal: render targets released after Reset: %lu (used afterwards: texture %lu, target %lu)\n",
                 g_rt_freed, g_freed_use_smp, g_freed_use_tgt);
         fprintf(stderr, "metal: Z surface: %llu passes without Z, %llu passes size mismatch (scratch)\n",

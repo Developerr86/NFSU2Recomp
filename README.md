@@ -4,6 +4,11 @@ https://github.com/user-attachments/assets/f58f98bd-ca90-48fa-9a7d-5d056cf0cbbb
 
 # Need for Speed: Underground 2 on Mac — native Apple Silicon port, no Wine
 
+> **iOS port (this fork, branch `ios`):** the game runs on a jailbroken **iPad mini 2**
+> (A7, 1 GB RAM, iOS 12): a stable 60 fps on low settings, about 30 fps (dipping towards 20)
+> maxed out. More optimisation is coming, and the iPhone SE (2016) is the next device
+> to test. Details, build steps and status: [`ios/README.md`](ios/README.md).
+
 **Play *Need for Speed: Underground 2* (NFSU2, 2004) natively on Apple Silicon
 Macs (M1 and later): no Wine, no CrossOver, no emulator, no virtual machine.**
 

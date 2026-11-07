@@ -63,7 +63,7 @@ void gamepad_install(void){
     if ((e = getenv("NFSU2_PAD_DEADZONE"))) g_dead = (float)atof(e);
     if ((e = getenv("NFSU2_PAD_FAKE"))){ g_fake = 1; parse_fake(e); snprintf(g_name, sizeof g_name, "Fake Pad"); }
     @autoreleasepool {
-        if (@available(macOS 11.3, *))
+        if (@available(macOS 11.3, iOS 14.0, tvOS 14.0, *))
             GCController.shouldMonitorBackgroundEvents = YES;
         [[NSNotificationCenter defaultCenter]
             addObserverForName:GCControllerDidConnectNotification object:nil queue:nil
@@ -144,9 +144,16 @@ void gamepad_fill(unsigned char *dst){
         int d = deg[h + 1][w + 1];
         if (d >= 0) pov[0] = (uint32_t)d;
     }
+    /* buttonOptions/buttonMenu are iOS 13+, the stick buttons iOS 12.1+: on the iPad
+     * (iOS 12.5) ask first instead of sending an unknown selector. */
+#define PADBTN(sel_) ([g respondsToSelector:@selector(sel_)] ? [g performSelector:@selector(sel_)] : nil)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
     GCControllerButtonInput *bs[10] = { g.buttonA, g.buttonB, g.buttonX, g.buttonY,
-        g.leftShoulder, g.rightShoulder, g.buttonOptions, g.buttonMenu,
-        g.leftThumbstickButton, g.rightThumbstickButton };
+        g.leftShoulder, g.rightShoulder, PADBTN(buttonOptions), PADBTN(buttonMenu),
+        PADBTN(leftThumbstickButton), PADBTN(rightThumbstickButton) };
+#pragma clang diagnostic pop
+#undef PADBTN
     for (int i = 0; i < 10; i++) if (bs[i] && bs[i].pressed){ btn[i] = 0x80; g_pressed++; }
 }
 

@@ -11,6 +11,8 @@
 #include <math.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <TargetConditionals.h>
 
 /* getenv() SCANS the environment array and takes a lock on every call.  On
  * per-draw paths (for example the "PDLIST" check in SetVertexShaderConstantF
@@ -165,6 +167,37 @@ static int gfx_at(uint32_t u, uint32_t addr, int end){
     return (end ? g_gfree[k].addr + g_gfree[k].size : g_gfree[k].addr) == addr ? k : -1;
 }
 static void gext_unlink(int k){ gbin_del(k); gfx_set(k, 0); g_gb_next--; }
+/* --- MEMORY: hand free pages back to the OS (iOS footprint) ---------------
+ * Freed buffer-heap memory used to stay dirty for the life of the process: jetsam
+ * counts it (phys_footprint).  The whole pages inside a free range are replaced by
+ * fresh zero pages (MAP_FIXED anonymous mapping over the guest space), so they cost
+ * nothing until written again.  NFSU2_PAGERETURN=0/1 (default: on for iOS). */
+static int pageret_on(void){
+    static int v = -1;
+    if (v < 0){ const char *e = getenv("NFSU2_PAGERETURN");
+#if TARGET_OS_IPHONE
+        v = !(e && *e == '0');
+#else
+        v = (e && *e == '1');
+#endif
+    }
+    return v;
+}
+static uint64_t g_pageret_bytes;
+void guest_pages_return(uint32_t a, uint32_t s){
+    /* only big ranges: returned pages fault + zero-fill again when reused (on the
+     * A7 a 64 KB threshold churned ~0.5 MB/frame); NFSU2_PAGERET_MIN bytes, default 1 MB */
+    static uint32_t minb = 0;
+    if (!minb){ const char *e = getenv("NFSU2_PAGERET_MIN"); minb = (e && *e) ? (uint32_t)strtoul(e, 0, 0) : (1u << 20);
+                if (minb < 65536u) minb = 65536u; }
+    if (!pageret_on() || s < minb) return;
+    uint64_t ps = (uint64_t)getpagesize();
+    uint64_t lo = ((uint64_t)a + ps - 1) & ~(ps - 1), hi = ((uint64_t)a + s) & ~(ps - 1);
+    if (hi <= lo) return;
+    void *r = mmap(g_mem + lo, (size_t)(hi - lo), PROT_READ|PROT_WRITE,
+                   MAP_FIXED|MAP_PRIVATE|MAP_ANON, -1, 0);
+    if (r != MAP_FAILED) g_pageret_bytes += hi - lo;
+}
 /* node k (addr/size set) leaves the quarantine: merge with free neighbours */
 static void gext_release(int k){
     uint32_t a = g_gfree[k].addr, s = g_gfree[k].size;
@@ -175,6 +208,7 @@ static void gext_release(int k){
     }
     { int j = gfx_at((a + s - GBUF_BASE) >> 6, a + s, 0);
       if (j >= 0){ gext_unlink(j); s += g_gfree[j].size; gnode_put(j); } }
+    guest_pages_return(a, s);
     if (a + s == gbuf_ptr){ gbuf_ptr = a; g_gb_free_bytes -= s; gnode_put(k); return; }
     g_gfree[k].addr = a; g_gfree[k].size = s; g_gfree[k].state = GN_FREE;
     gfx_set(k, (uint32_t)k + 1u); gbin_ins(k); g_gb_next++;
@@ -223,6 +257,27 @@ static void gbuf_free(uint32_t p){
     if (g_gq_tail >= 0) g_gfree[g_gq_tail].next = k; else g_gq_head = k;
     g_gq_tail = k;
     g_gb_freed++; g_gb_bytes_freed += n; g_gb_live -= n; g_gb_quar_bytes += n;
+    pthread_mutex_unlock(&g_gb_lk);
+}
+/* Free without quarantine: for data that has already been copied out (a texture
+ * level after UnlockRect uploaded it; see TEXTURE DATA SHEDDING). */
+static void gbuf_free_now(uint32_t p){
+    if (!p) return;
+    pthread_mutex_lock(&g_gb_lk);
+    gbuf_init();
+    uint32_t n = (p >= GBUF_BASE && p < gbuf_ptr && !(p & 63u)) ? g_gsz[(p - GBUF_BASE) >> 6] : 0;
+    if (!n){ g_gb_bad++; pthread_mutex_unlock(&g_gb_lk); return; }
+    g_gsz[(p - GBUF_BASE) >> 6] = 0;
+    g_gb_freed++; g_gb_bytes_freed += n; g_gb_live -= n;
+    if (g_gb_merge){
+        int k = gnode_get();
+        g_gfree[k].addr = p; g_gfree[k].size = n; g_gfree[k].stamp = (uint32_t)g_present;
+        g_gfree[k].next = -1; gext_release(k);
+    } else {
+        int k = gnode_get(); uint32_t bk = (n >> 6) % GBUF_NB;
+        g_gfree[k].addr = p; g_gfree[k].size = n; g_gfree[k].state = GN_BUCKET; g_gb_free_bytes += n;
+        g_gfree[k].next = g_gfree_head[bk]; g_gfree_head[bk] = k;
+    }
     pthread_mutex_unlock(&g_gb_lk);
 }
 static uint32_t gbuf_alloc(uint32_t n){
@@ -364,6 +419,8 @@ static void obj_release(uint32_t o, uint32_t iface, uint32_t from){
     if (iface == IF_VB || iface == IF_IB){
         if (mem_is_committed(o+11)){ gbuf_free(MR32(o+8)); MR32(o+8)=0; }
     } else if (iface == IF_TEX && mem_is_committed(o+67)){
+        /* the Metal texture too (metal.m TEXTURE MEMORY; deferred, iOS default) */
+        { void metal_tex_release(unsigned); metal_tex_release(MR32(o+28)); }
         for (uint32_t q=32; q<64; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
         if (mem_is_committed(o+143) && MR32(o+140)==0xC0BEC0BEu)
             for (uint32_t q=104; q<136; q+=4){ gbuf_free(MR32(o+q)); MR32(o+q)=0; }
@@ -420,7 +477,7 @@ static VSConst  g_vsk;                  /* c#/i#/b# constant file */
 static unsigned g_cur_vs = 0;
 static uint64_t g_vs_draws = 0, g_ff_draws = 0;
 static uint64_t g_v_in = 0, g_v_out = 0, g_v_badw = 0;
-static uint64_t g_tex_fail = 0;
+static uint64_t g_tex_fail = 0, g_tex_shed = 0;
 static uint64_t g_dikey_calls=0, g_dikey_hits=0;
 static uint64_t g_mat_ok=0, g_mat_bad=0;
 static uint64_t g_di_enum=0, g_di_objs=0;
@@ -3430,8 +3487,9 @@ int com_call(CPU *c, uint32_t magic){
                     fprintf(stderr,"  [RT-tex] %ux%u -> %ux%u (NFSRES)\n", w,h,g_bb_w,g_bb_h); }
                 w = g_bb_w; h = g_bb_h;
             }
-            uint32_t pp=A(c,7); uint32_t t=com_new(IF_TEX,64);
+            uint32_t pp=A(c,7); uint32_t t=com_new(IF_TEX,72);
             MR32(t+4)=w; MR32(t+8)=h; MR32(t+20)=fmt; MR32(t+24)=lev?lev:1u;
+            MR32(t+64)=(usage & 0xFFFFu) | ((pool & 0xFFu) << 16) | 0x01000000u;   /* see TEXTURE DATA SHEDDING */
             /* HD build: reflection targets grow in Metal, the game keeps seeing the old size
              * (not compiled into the original build). */
             uint32_t mw = w, mh = h, mlev = lev ? lev : 1u;
@@ -3805,6 +3863,26 @@ int com_call(CPU *c, uint32_t magic){
                     metal_upload_texture(mid, level, g_mem+buf,
                                          metal_level_pitch(w,level,fmt), w, h, fmt);
             }
+            /* TEXTURE DATA SHEDDING: the level was copied into the Metal texture above
+             * (decoded / replaceRegion / ordered-upload buffer, all synchronous), so the
+             * guest copy of a static texture is dead weight -- every texture used to be
+             * held twice (guest DXT + Metal).  Freed at once (no quarantine); a later
+             * LockRect of the level gets a fresh zeroed buffer.  Skipped for render
+             * targets (usage 1), dynamic textures (0x200), cubes, and textures created
+             * before this field existed.  NFSU2_TEXSHED=0/1 (default: on for iOS). */
+            { static int shed = -1;
+              if (shed < 0){ const char *e = getenv("NFSU2_TEXSHED");
+#if TARGET_OS_IPHONE
+                  shed = !(e && *e == '0');
+#else
+                  shed = (e && *e == '1');
+#endif
+              }
+              if (shed && iface == IF_TEX && !is_cube2 && buf && mid && mem_is_committed(self+67)){
+                  uint32_t up = MR32(self+64);
+                  if ((up & 0x01000000u) && !(up & 0x201u)){
+                      gbuf_free_now(buf); MR32(self + 32u + 4u*level) = 0; g_tex_shed++; }
+              } }
             if (ENVC("LOCKLOG") && w==640 && h==480){
                 static int nl=0;
                 if (nl<3){ nl++;
@@ -4396,6 +4474,13 @@ int com_call(CPU *c, uint32_t magic){
                 memset(g_act_of_key, 0, sizeof g_act_of_key);
                 memset(g_act_ofs, 0, sizeof g_act_ofs);
                 g_act_count = 0;
+                /* Keys HELD across a map switch (gas held through the race countdown ->
+                 * the race map at GO) must reach the new map as a fresh press: events are
+                 * edge-based, so without this the held key was never seen by the race and
+                 * the car sat still (iPad, 2026-11-07; the Mac only escaped because its
+                 * scripted press landed after GO).  The next GetDeviceData then reports
+                 * every key that is down now as pressed in the new map. */
+                memset(g_kb_prev, 0, sizeof g_kb_prev);
                 if (ENVC("DIMAP")) fprintf(stderr,"  [map] --- new active map ---\n");
             }
             if (af && mem_is_committed(af+71)){
@@ -4441,7 +4526,7 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t want = (pcnt && mem_is_committed(pcnt+3)) ? MR32(pcnt) : 0;
             uint32_t n = 0;
             { static int sg=0;
-              if (ENVC("DIDATA") && sg<4){ sg++;
+              if (ENVC("DIDATA") && sg < (atoi(ENVC("DIDATA")) > 1 ? 40 : 4)){ sg++;
                 fprintf(stderr,"  [DIdata] cb=%u requested=%u flags=0x%x action=%d\n",
                         cb, want, flags, g_act_count); } }
             if (g_act_count && metal_available() && cb >= 16u && cb <= 32u){
@@ -4460,7 +4545,7 @@ int com_call(CPU *c, uint32_t magic){
                         MR32(e+12) = g_di_seq++;
                         if (cb >= 20u) MR32(e+16) = g_act_of_key[k];
                         { static int se=0;
-                          if (ENVC("DIDATA") && se<6){ se++;
+                          if (ENVC("DIDATA") && se < (atoi(ENVC("DIDATA")) > 1 ? atoi(ENVC("DIDATA")) : 6)){ se++;
                             fprintf(stderr,"  [DIdata] event: dik=%u ofs=%u data=0x%x app=0x%x\n",
                                     k, g_act_ofs[k], now?0x80u:0u, g_act_of_key[k]); } }
                     }
@@ -4756,6 +4841,8 @@ void com_report(void){
             (unsigned long long)g_st_ok,(unsigned long long)g_st_null,
             (unsigned long long)g_st_zero,(unsigned long long)g_st_other);
     fprintf(stderr,"  texture creation  : %llu failed\n", (unsigned long long)g_tex_fail);
+    fprintf(stderr,"  memory            : %llu texture levels shed after upload, %llu MB of free pages returned to the OS\n",
+            (unsigned long long)g_tex_shed, (unsigned long long)(g_pageret_bytes >> 20));
     fprintf(stderr,"  of which in vs_run: %.2f s\n", g_t_vs_ns/1e9);
     fprintf(stderr,"  --- VERTICES PER SHADER ---\n");
     for (int q=0;q<8;q++){

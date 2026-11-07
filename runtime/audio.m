@@ -7,6 +7,7 @@
  *
  * The mixer converts to 44.1 kHz, 2-channel, 16-bit output; source buffers may
  * have different rates/channels (nearest-neighbor resampling). */
+#include <TargetConditionals.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <AudioUnit/AudioUnit.h>
 #include <stdint.h>
@@ -524,7 +525,11 @@ static int au_start(const AudioStreamBasicDescription *f){
     AudioComponentDescription d;
     memset(&d, 0, sizeof d);
     d.componentType         = kAudioUnitType_Output;
+#if TARGET_OS_IPHONE
+    d.componentSubType      = kAudioUnitSubType_RemoteIO;   /* iOS: the session is set up in ios_app.m */
+#else
     d.componentSubType      = kAudioUnitSubType_DefaultOutput;
+#endif
     d.componentManufacturer = kAudioUnitManufacturer_Apple;
     AudioComponent comp = AudioComponentFindNext(NULL, &d);
     if (!comp) return 0;

@@ -88,6 +88,7 @@ static void ext_del(uint32_t i){
     memmove(g_ext_s + i, g_ext_s + i + 1, (g_ext_n - i - 1u) * 4u);
     g_ext_n--;
 }
+void guest_pages_return(uint32_t a, uint32_t s);   /* com.c: free pages back to the OS */
 static void ext_add(uint32_t a, uint32_t s){
     uint32_t i = ext_find(a);
     if (i > 0 && g_ext_a[i-1] + g_ext_s[i-1] == a){          /* merge with the one below */
@@ -96,7 +97,7 @@ static void ext_add(uint32_t a, uint32_t s){
     if (i < g_ext_n && a + s == g_ext_a[i]){                 /* and the one above */
         s += g_ext_s[i]; ext_del(i);
     }
-    if (a + s == g_top){ g_top = a; return; }                /* back to the wilderness */
+    if (a + s == g_top){ g_top = a; guest_pages_return(a, s); return; }   /* back to the wilderness */
     if (g_ext_n == g_ext_cap){
         g_ext_cap = g_ext_cap ? g_ext_cap * 2u : 256u;
         g_ext_a = realloc(g_ext_a, 4u * g_ext_cap); g_ext_s = realloc(g_ext_s, 4u * g_ext_cap);
@@ -105,6 +106,7 @@ static void ext_add(uint32_t a, uint32_t s){
     memmove(g_ext_s + i + 1, g_ext_s + i, (g_ext_n - i) * 4u);
     g_ext_a[i] = a; g_ext_s[i] = s; g_ext_n++;
     set_hdr(a, 0, SIG_FREE, s);
+    guest_pages_return(a + HDR, s - HDR);                     /* keeps the header's page */
 }
 
 /* a block leaves the quarantine (or skips it) and becomes reusable */

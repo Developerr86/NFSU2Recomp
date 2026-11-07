@@ -32,16 +32,57 @@ uint8_t g_cbits[1u<<15] = {0};
 
 
 void mprot_arm(uint32_t);
+/* Reserved size.  4 GB on macOS.  iOS (iPad mini 2, 16 KB __PAGEZERO): the full
+ * 4 GB is granted only sometimes (9/20 launches measured), >= ~3 GB always; the
+ * guest's map stays below 2 GB (main stack ends at 0x7FF00000), so the largest
+ * available block is taken.  Translation is unchanged (base + 32-bit offset):
+ * an access beyond g_memsz is no longer guaranteed to fault (debug aid only). */
+uint64_t g_memsz = GSZ;
+#if defined(NFS_GUEST_IN_IMAGE) && NFS_GUEST_IN_IMAGE
+/* iOS (jailbroken iPad mini 2): the guest space is a 4 GB zero-fill array INSIDE the
+ * executable.  With the 16 KB __PAGEZERO the kernel maps the main image at the bottom
+ * of the address space, so the image (and this array) covers 0..4 GB and every dylib
+ * is loaded ABOVE 4 GB.  Needed because the jailbreak's injected
+ * pspawn_payload-stg2.dylib, when loaded below 4 GB (plain 16 KB pagezero), makes
+ * libxpc jump to 0x2_0000_0000 | low32(its hook) during GameController's initializer
+ * (crash 2026-11-07).  Untouched zero-fill pages cost no memory; mem_init re-protects
+ * the array PROT_NONE so uncommitted accesses still fault as on macOS. */
+/* own segment, laid out after __DATA: inside __bss it pushed other globals beyond ADRP range */
+static uint8_t g_guest_image[GSZ] __attribute__((section("__GUEST,__mem,zerofill"), aligned(16384)));
+void mem_init(void){
+    if (g_mem) return;
+    g_mem = g_guest_image;
+    if (mprotect(g_mem, GSZ, PROT_NONE) != 0) perror("mprotect guest image");
+    fprintf(stderr, "mem: guest space 4096 MB in the image at %p\n", (void *)g_mem);
+}
+#else
 void mem_init(void){
     if (g_mem) return;
     g_mem = mmap(0, GSZ, PROT_NONE, MAP_PRIVATE|MAP_ANON|MAP_NORESERVE, -1, 0);
-    if (g_mem == MAP_FAILED){ perror("mmap 4GB"); exit(1); }
+    if (g_mem == MAP_FAILED){
+        uint64_t lo = 0, hi = GSZ;                       /* 16 MB resolution */
+        while (hi - lo > (16ull << 20)){
+            uint64_t mid = ((lo + hi) / 2) & ~((16ull << 20) - 1);
+            void *p = mmap(0, mid, PROT_NONE, MAP_PRIVATE|MAP_ANON|MAP_NORESERVE, -1, 0);
+            if (p != MAP_FAILED){ munmap(p, mid); lo = mid; } else hi = mid;
+        }
+        if (lo < 0x80000000ull){ fprintf(stderr, "mem: only %llu MB of address space, need 2048\n",
+                                         (unsigned long long)(lo >> 20)); exit(1); }
+        g_mem = mmap(0, lo, PROT_NONE, MAP_PRIVATE|MAP_ANON|MAP_NORESERVE, -1, 0);
+        if (g_mem == MAP_FAILED){ perror("mmap guest"); exit(1); }
+        g_memsz = lo;
+    }
+    fprintf(stderr, "mem: guest space %llu MB reserved at %p\n", (unsigned long long)(g_memsz >> 20), (void *)g_mem);
 }
+#endif
 
 void mem_commit(uint32_t addr, uint32_t size){
     uint64_t lo = addr & ~0x3FFFull;                    /* 16 KB page */
     uint64_t hi = ((uint64_t)addr + size + 0x3FFF) & ~0x3FFFull;
     if (hi > 0x100000000ull) hi = 0x100000000ull;
+    if (hi > g_memsz){
+        fprintf(stderr,"mem_commit 0x%08x+%u beyond the reserved %llu MB\n", addr, size,
+                (unsigned long long)(g_memsz >> 20)); exit(1); }
     if (mprotect(g_mem + lo, hi - lo, PROT_READ|PROT_WRITE) != 0){
         fprintf(stderr,"mem_commit 0x%08x+%u failed\n", addr, size); exit(1);
     }
@@ -160,7 +201,7 @@ static void segv(int sig, siginfo_t *si, void *uc){
       if (ffn) fprintf(stderr,"\n*** FAULTING GUEST FUNCTION: sub_%08x\n", ffn);
     }
     uint8_t *p = (uint8_t*)si->si_addr;
-    if (p >= g_mem && p < g_mem + GSZ)
+    if (p >= g_mem && p < g_mem + g_memsz)
         fprintf(stderr,"\n*** GUEST MEMORY FAULT: guest address 0x%08llx (unmapped)\n",
                 (unsigned long long)(p - g_mem));
     else

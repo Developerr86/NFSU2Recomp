@@ -34,7 +34,14 @@
 #include <sys/time.h>
 #include <sys/event.h>
 #include <sys/resource.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+/* iOS SDK has no <libproc.h>; the call exists in libSystem */
+#include <sys/resource.h>
+int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);
+#else
 #include <libproc.h>
+#endif
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
