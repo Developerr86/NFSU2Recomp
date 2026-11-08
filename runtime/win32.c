@@ -315,6 +315,20 @@ int win32_call(CPU *c, uint32_t idx){
         if (ENVC("QPCWHO")) qpc_who(c);
         if (c->eip == GA(0x43bdfeu)) qpc_spin_sleep(c);
         uint64_t v = host_qpc(); uint32_t p=ARG(c,0);
+#if defined(NFS_EXE_NA) && NFS_EXE_NA
+        /* EA's busy-wait delay helper (sub_006f5eb3 -> QPC wrapper sub_006f5e98, return
+         * 0x006f5eab).  The movie player's CPU-speed probe (sub_006f5f14) spins on it for
+         * 5 x 200 ms of QPC time inside ONE frame; the hybrid virtual clock advances
+         * <= ~50 ms within a frame, so the probe never finished: the game hung at the
+         * first video (why upstream needed NOMOVIES).  A delay loop means wall time:
+         * give it the real clock, and sleep 100 us with the GIL released per poll so
+         * it neither burns the CPU nor blocks the other guest threads.  NA addresses. */
+        if (c->eip == 0x006f5eabu){
+            guest_sleep_ns(100000L);
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            v = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+        }
+#endif
         if(p){ MR32(p)=(uint32_t)v; MR32(p+4)=(uint32_t)(v>>32); } r=1; }
     else if (!strcmp(n,"GetVersion"))            r = 0x0A280105u;      /* 5.1.2600 */
     else if (!strcmp(n,"GetModuleHandleA"))      r = 0x00400000u;

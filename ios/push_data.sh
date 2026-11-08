@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Copy the PC game folder to the iPad (/var/mobile/Media/NFSU2). Resumable: only files
 # missing on the device or with a different size are sent (the iPad has no rsync).
-# Skipped: MOVIES (the port runs with NOMOVIES), SDATA_OLD, Support, Windows DLLs/EXEs
+# Skipped: SDATA_OLD, Support, Windows DLLs/EXEs
 # other than SPEED2.EXE. Game data: never commit it.
 # Usage: ios/push_data.sh "<game dir>" [ssh-host]     env IPAD_SSH_OPTS: extra ssh options
 set -euo pipefail
@@ -13,7 +13,7 @@ TMP=$(mktemp -d)
 "${SSH[@]}" "mkdir -p $ROOT && cd $ROOT && find . -type f -exec ls -ln {} +" \
   | perl -ane 'print "$F[4] ", join(" ", @F[8..$#F]), "\n"' | sort > "$TMP/remote"
 ( cd "$GAME" && find . -type f \
-    ! -path './MOVIES/*' ! -path './SDATA_OLD/*' ! -path './Support/*' ! -name '.DS_Store' \
+    ! -path './SDATA_OLD/*' ! -path './Support/*' ! -name '.DS_Store' \
     ! -iname '*.dll' ! -iname '*.asi' \( ! -iname '*.exe' -o -iname 'SPEED2.EXE' \) \
     -exec stat -f '%z %N' {} + ) | sort > "$TMP/local"
 comm -23 "$TMP/local" "$TMP/remote" | cut -d' ' -f2- > "$TMP/todo"

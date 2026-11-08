@@ -55,7 +55,9 @@ void app_set_defaults(void){
     setdef("ALARM", "0");
     setdef("FIXMAT", "1");
     setdef("FIXMAT_MODE", "3");
-    setdef("NOMOVIES", "1");
+    /* movies play: the game's own VP6 decoder runs fine once EA's CPU-speed probe gets
+     * real time (win32.c) and the stream cursor moves smoothly (audio.m) */
+    setdef("NOMOVIES", "0");
     setdef("SNDSYNC", "1");
     setdef("GPUVS", "1");
     /* iPad mini 2: 2048x1536 (4:3) screen, A7 GPU.  The game renders at its own

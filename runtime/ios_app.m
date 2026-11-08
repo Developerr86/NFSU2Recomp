@@ -44,6 +44,14 @@ static unsigned char env_key(const char *name, unsigned char def){
 + (Class)layerClass { return [CAMetalLayer class]; }
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     (void)event;
+    /* During a movie a tap is Enter: the game's own skip (the opening FMV and the story
+     * movies take Enter; the EA/THX logos and the PSA ignore all input, as on the PC). */
+    { int fileio_movie_playing(void);
+      if (fileio_movie_playing()){
+          metal_ios_key(0x1C, 1);
+          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+              metal_ios_key(0x1C, 0); });
+          return; } }
     if (mouseTouch) return;
     mouseTouch = [touches anyObject];
     CGPoint p = [mouseTouch locationInView:self];
@@ -74,6 +82,46 @@ static unsigned char env_key(const char *name, unsigned char def){
 }
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { (void)event; [self endMouse:touches]; }
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { (void)event; [self endMouse:touches]; }
+@end
+
+/* ---- system keyboard for the game's text boxes (profile name) -----------------
+ * Shown while the game has a text box taking characters (win32_ext.c
+ * nfs_textbox_active, polled every 100 ms); typed text goes to the WM_CHAR queue the
+ * window procedure reads (Return = 0x0D accept, Backspace = 0x08). */
+int  nfs_textbox_active(void);
+void metal_ios_char(unsigned char ch);
+@interface NfsKeyInput : UIView <UIKeyInput, UITextInputTraits> @end
+@implementation NfsKeyInput
+@synthesize autocapitalizationType, autocorrectionType, spellCheckingType, keyboardType,
+            keyboardAppearance, returnKeyType, enablesReturnKeyAutomatically, secureTextEntry,
+            smartQuotesType, smartDashesType, smartInsertDeleteType;
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])){
+        self.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        self.autocorrectionType = UITextAutocorrectionTypeNo;
+        self.spellCheckingType = UITextSpellCheckingTypeNo;
+        self.keyboardType = UIKeyboardTypeASCIICapable;
+        self.keyboardAppearance = UIKeyboardAppearanceDark;
+        self.returnKeyType = UIReturnKeyDone;
+        if (@available(iOS 11.0, *)){
+            self.smartQuotesType = UITextSmartQuotesTypeNo;
+            self.smartDashesType = UITextSmartDashesTypeNo;
+            self.smartInsertDeleteType = UITextSmartInsertDeleteTypeNo;
+        }
+        self.userInteractionEnabled = NO;
+    }
+    return self;
+}
+- (BOOL)canBecomeFirstResponder { return YES; }
+- (BOOL)hasText { return YES; }
+- (void)insertText:(NSString *)text {
+    for (NSUInteger i = 0; i < text.length; i++){
+        unichar u = [text characterAtIndex:i];
+        if (u == '\n' || u == '\r') metal_ios_char(0x0D);
+        else if ((u >= 0x20 && u < 0x7F) || (u >= 0xA0 && u <= 0xFF)) metal_ios_char((unsigned char)u);
+    }
+}
+- (void)deleteBackward { metal_ios_char(0x08); }
 @end
 
 /* ---- on-screen controls ------------------------------------------------------ */
@@ -118,7 +166,12 @@ static unsigned char env_key(const char *name, unsigned char def){
 @end
 
 @interface NfsVC : UIViewController @end
-@implementation NfsVC { UIView *pad; }
+@implementation NfsVC { UIView *pad; NfsKeyInput *keys; }
+- (void)pollTextBox {
+    int on = nfs_textbox_active();
+    if (on && !keys.isFirstResponder) [keys becomeFirstResponder];
+    else if (!on && keys.isFirstResponder) [keys resignFirstResponder];
+}
 - (void)loadView {
     NfsView *v = [[NfsView alloc] initWithFrame:[UIScreen mainScreen].bounds];
     v.multipleTouchEnabled = YES;
@@ -156,6 +209,9 @@ static unsigned char env_key(const char *name, unsigned char def){
     [self addKey:@"▼" dik:env_key("NFSU2_KEY_DOWN", 0xD0)  frame:CGRectMake(g * 2 + 80, g, 70, 54) to:pad mask:TL];
     pad.hidden = getenv("NFSU2_NOPAD") && getenv("NFSU2_NOPAD")[0] == '1';
     [self.view addSubview:pad];
+    keys = [[NfsKeyInput alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
+    [self.view addSubview:keys];
+    [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(pollTextBox) userInfo:nil repeats:YES];
 }
 @end
 
@@ -214,6 +270,11 @@ static void *boot_thread(void *arg){
     [NSTimer scheduledTimerWithTimeInterval:10.0 target:self selector:@selector(sampleBattery) userInfo:nil repeats:YES];
     { NSError *e = nil;
       [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&e];
+      /* small device slice: the play cursor the game writes against advances per callback;
+       * the default 1024 frames (23 ms) left no margin under the write lead (see audio.m).
+       * NFSU2_IOBUF_MS overrides (default 5.8 ms = 256 frames at 44.1 kHz). */
+      { const char *b = getenv("NFSU2_IOBUF_MS"); double ms = (b && *b) ? atof(b) : 5.8;
+        [[AVAudioSession sharedInstance] setPreferredIOBufferDuration:ms / 1000.0 error:&e]; }
       [[AVAudioSession sharedInstance] setActive:YES error:&e]; }
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     NfsVC *vc = [NfsVC new];

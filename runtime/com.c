@@ -500,6 +500,7 @@ static uint32_t g_act_of_key[256];      /* DIK -> uAppData (0 = not bound) */
 static uint32_t g_act_ofs[256];         /* DIK -> offset in the action array */
 static int      g_act_count = 0;
 static unsigned char g_kb_prev[256];
+static uint32_t g_relatch_at[256];      /* KEY RELATCH: re-press due (ms), 0 = none */
 static uint32_t g_di_seq = 1;
 static uint64_t g_di_events = 0;
 static uint32_t host_us_ms(void){ uint64_t host_us(void); return (uint32_t)(host_us()/1000ull); }
@@ -3835,6 +3836,14 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t slot = self ? (is_cube ? (self + 104u + 4u*(face & 7u))
                                             : (self + 32u + 4u*level)) : 0;
             uint32_t buf = slot ? MR32(slot) : 0;
+            /* TEXSHEDLOG=1: a lock of a level whose guest copy was shed (see TEXTURE DATA SHEDDING) */
+            if (!buf && iface==IF_TEX && self && mem_is_committed(self+71) &&
+                (MR32(self+64) & 0x01000000u) && (MR32(self+68) & (1u << (level & 7u)))){
+                uint32_t prect = is_cube ? A(c,4) : A(c,3), lflags = is_cube ? A(c,5) : A(c,4);
+                static int nl = 0;
+                if (nl++ < (ENVC("TEXSHEDLOG") ? 200 : 5)) fprintf(stderr, "  [shed] RELOCK tex %08x %ux%u fmt=%u lev=%u usage/pool=%08x rect=%s flags=0x%x from %08x\n",
+                        self, w, h, fmt, level, MR32(self+64), prect ? "part" : "all", lflags, c->eip);
+            }
             if(!buf){ buf = gbuf_alloc(pitch*rows + 64u); if(slot) MR32(slot)=buf;
                      if (iface==IF_SURF) g_gb_kept[2] += (pitch*rows + 127u) & ~63u; }
             if(plr){ mem_commit(plr,8); MR32(plr)=pitch; MR32(plr+4)=buf; }
@@ -3878,10 +3887,16 @@ int com_call(CPU *c, uint32_t magic){
                   shed = (e && *e == '1');
 #endif
               }
-              if (shed && iface == IF_TEX && !is_cube2 && buf && mid && mem_is_committed(self+67)){
+              /* DXT only: the game re-locks uncompressed (A8R8G8B8, managed) textures to
+               * recomposite them -- car skins, vinyls, rims (0x005b96b9..0x005bc01d, whole-level
+               * read/write locks): shedding those erased the 350Z's wheels and vinyl.  DXT
+               * textures come from the files and were never re-locked (TEXSHEDLOG run). */
+              int dxt = (fmt == 0x31545844u || fmt == 0x33545844u || fmt == 0x35545844u);
+              if (shed && dxt && iface == IF_TEX && !is_cube2 && buf && mid && mem_is_committed(self+71)){
                   uint32_t up = MR32(self+64);
                   if ((up & 0x01000000u) && !(up & 0x201u)){
-                      gbuf_free_now(buf); MR32(self + 32u + 4u*level) = 0; g_tex_shed++; }
+                      gbuf_free_now(buf); MR32(self + 32u + 4u*level) = 0; g_tex_shed++;
+                      if (mem_is_committed(self+71)) MR32(self+68) |= 1u << (level & 7u); }
               } }
             if (ENVC("LOCKLOG") && w==640 && h==480){
                 static int nl=0;
@@ -4474,14 +4489,17 @@ int com_call(CPU *c, uint32_t magic){
                 memset(g_act_of_key, 0, sizeof g_act_of_key);
                 memset(g_act_ofs, 0, sizeof g_act_ofs);
                 g_act_count = 0;
-                /* Keys HELD across a map switch (gas held through the race countdown ->
-                 * the race map at GO) must reach the new map as a fresh press: events are
-                 * edge-based, so without this the held key was never seen by the race and
-                 * the car sat still (iPad, 2026-11-07; the Mac only escaped because its
-                 * scripted press landed after GO).  The next GetDeviceData then reports
-                 * every key that is down now as pressed in the new map. */
-                memset(g_kb_prev, 0, sizeof g_kb_prev);
-                if (ENVC("DIMAP")) fprintf(stderr,"  [map] --- new active map ---\n");
+                /* KEY RELATCH: a key held across a map switch (gas through the countdown)
+                 * is reported again as pressed in the new map -- but only once it has
+                 * stayed down RELATCH_MS (250) after the switch.  Re-reporting at once
+                 * (2026-11-07 fix) made the Esc that opened the pause menu arrive in the
+                 * pause map as "back" and close it again.  NFSU2_KEYRELATCH=0: off. */
+                { const char *e = ENVC("NFSU2_KEYRELATCH");
+                  if (!(e && *e == '0')){
+                      uint32_t due = host_us_ms() + 250u;
+                      for (int k = 1; k < 256; k++) if (g_kb_prev[k]) g_relatch_at[k] = due; } }
+                if (ENVC("DIMAP")) fprintf(stderr,"  [map] --- new active map --- (present %llu)\n",
+                                           (unsigned long long)g_present);
             }
             if (af && mem_is_committed(af+71)){
                 uint32_t nact=MR32(af+12), rg=MR32(af+16), asz=MR32(af+4);
@@ -4532,8 +4550,14 @@ int com_call(CPU *c, uint32_t magic){
             if (g_act_count && metal_available() && cb >= 16u && cb <= 32u){
                 unsigned char cur[256];
                 metal_fill_keyboard(cur, 256);
+                uint32_t tnow = host_us_ms();
                 for (uint32_t k = 1; k < 256u && n < want; k++){
                     if (!g_act_of_key[k]) continue;
+                    if (g_relatch_at[k]){                  /* see KEY RELATCH */
+                        if (!cur[k]) g_relatch_at[k] = 0;
+                        else if ((int32_t)(tnow - g_relatch_at[k]) >= 0){
+                            g_relatch_at[k] = 0; if (!(flags & 1u)) g_kb_prev[k] = 0; }
+                    }
                     unsigned char now = cur[k] ? 1 : 0, was = g_kb_prev[k];
                     if (now == was) continue;
                     if (rg && !(flags & 1u)){          /* consume unless DIGDD_PEEK */

@@ -209,8 +209,17 @@ int main(int argc,char**argv){
         /* Set up the Metal device BEFORE the guest starts: the game creates its first
          * textures before the window opens; without a device they silently vanish. */
         if (getenv("WINDOW")){ extern void metal_early_init(void); metal_early_init(); }
-        if (pthread_create(&th,&at,guest_main_thread,0)!=0){
-            fprintf(stderr,"could not create the guest main thread\n"); return 1; }
+        /* 1 GB first; if the address space has no such hole (iPad mini 2: the 4 GB guest
+         * image + shared cache leave it to ASLR luck -- seen on the first launch after an
+         * install), fall back to smaller stacks instead of failing. */
+        { static const size_t ss[] = { 1024ull<<20, 768ull<<20, 512ull<<20, 256ull<<20 };
+          int ok = 0;
+          for (unsigned k = 0; k < sizeof ss / sizeof ss[0] && !ok; k++){
+              pthread_attr_setstacksize(&at, ss[k]);
+              if (pthread_create(&th,&at,guest_main_thread,0)==0){ ok = 1;
+                  if (k) fprintf(stderr,"guest main thread: %zu MB stack (1 GB not available)\n", ss[k] >> 20); }
+          }
+          if (!ok){ fprintf(stderr,"could not create the guest main thread\n"); return 1; } }
         if (getenv("WINDOW")){
             /* macOS: the window must be on the MAIN thread; the guest is on a separate thread anyway */
             extern void metal_run_main_loop(void);

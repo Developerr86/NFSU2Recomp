@@ -101,11 +101,47 @@ static void gil_gave(void){
         }
     }
 }
-void guest_lock(CPU *c){ pthread_mutex_lock(&g_guest); tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took(); }
-void guest_unlock(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
-static void guest_yield_begin(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
+/* --- FAIR GIL --------------------------------------------------------------
+ * A plain mutex lets the thread that just released the GIL take it straight back
+ * before a woken waiter is scheduled.  On the iPad mini 2 (2 cores) the game's
+ * sound tick (a timeSetEvent callback, 0x006f5b4d) waited ~14 ms on average and up
+ * to 250 ms for the GIL behind the main thread; the music stream fell behind the
+ * play cursor and ~12% of it was muted (the stutter).  A FIFO ticket lock hands
+ * the GIL to waiters in arrival order.  NFSU2_FAIRGIL=0/1 (default: on for iOS). */
+#include <TargetConditionals.h>
+static pthread_mutex_t g_gil_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_gil_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t g_gil_next = 0, g_gil_serving = 0;
+static int gil_fair(void){
+    static int v = -1;
+    if (v < 0){ const char *e = getenv("NFSU2_FAIRGIL");
+#if TARGET_OS_IPHONE
+        v = !(e && *e == '0');
+#else
+        v = (e && *e == '1');
+#endif
+    }
+    return v;
+}
+static void gil_acquire(void){
+    if (!gil_fair()){ pthread_mutex_lock(&g_guest); return; }
+    pthread_mutex_lock(&g_gil_m);
+    uint64_t t = g_gil_next++;
+    while (t != g_gil_serving) pthread_cond_wait(&g_gil_cv, &g_gil_m);
+    pthread_mutex_unlock(&g_gil_m);
+}
+static void gil_release(void){
+    if (!gil_fair()){ pthread_mutex_unlock(&g_guest); return; }
+    pthread_mutex_lock(&g_gil_m);
+    g_gil_serving++;
+    if (g_gil_next != g_gil_serving) pthread_cond_broadcast(&g_gil_cv);   /* someone is queued */
+    pthread_mutex_unlock(&g_gil_m);
+}
+void guest_lock(CPU *c){ gil_acquire(); tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took(); }
+void guest_unlock(void){ gil_gave(); gil_release(); }
+static void guest_yield_begin(void){ gil_gave(); gil_release(); }
 static void guest_thread_die(void);
-static void guest_yield_end(void){ pthread_mutex_lock(&g_guest); g_cur_cpu = tl_cpu; gil_took();
+static void guest_yield_end(void){ gil_acquire(); g_cur_cpu = tl_cpu; gil_took();
     if (tl_obj && ((Obj*)tl_obj)->terminate) guest_thread_die(); }
 /* Sleep while releasing the big lock (win32.c: the game's frame wait loop). */
 uint64_t g_sleep_late_ns, g_sleep_gil_ns, g_sleep_n;    /* diagnostics: sleep latency / lock wait */
@@ -429,6 +465,9 @@ static uint64_t now_us(void){ return host_us(); }
 
 static void *timer_thread_main(void *p){
     (void)p;
+    /* the game's sound tick runs here: same QoS as the guest main thread, so it is
+     * not preempted while holding the GIL (see FAIR GIL) */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     mem_altstack_install();
     CPU cpu; memset(&cpu,0,sizeof cpu);
     uint32_t stack_lo, stack_hi, teb;
@@ -454,6 +493,7 @@ static void *timer_thread_main(void *p){
             pthread_mutex_lock(&g_lock);
             if (!g_tm[i].due_us || g_tm[i].due_us > now){ pthread_mutex_unlock(&g_lock); continue; }
             proc = g_tm[i].proc; user = g_tm[i].user; id = g_tm[i].id;
+            uint64_t due0 = g_tm[i].due_us;
             if (g_tm[i].period_us) g_tm[i].due_us = now + g_tm[i].period_us;
             else                   g_tm[i].due_us = 0;      /* a one-shot ends */
             pthread_mutex_unlock(&g_lock);
@@ -463,13 +503,45 @@ static void *timer_thread_main(void *p){
               /* stdcall: dw2, dw1, dwUser, uMsg, uTimerID  (right to left) */
               PUSH32(0u); PUSH32(0u); PUSH32(user); PUSH32(0u); PUSH32(id);
               PUSH32(0xDEAD7EADu); }
+            /* TIMERSTAT=1: lateness against the due time and the GIL wait, every 5 s */
+            static int tst = -1; if (tst < 0){ const char *e = getenv("TIMERSTAT"); tst = e && *e == '1'; }
+            uint64_t tw0 = tst ? gil_now_us() : 0;
             guest_lock(&cpu);
+            if (tst){
+                static uint64_t n, late_sum, late_max, gw_sum, gw_max, t_rep;
+                uint64_t tw1 = gil_now_us(), gw = tw1 - tw0;
+                uint64_t late = now - due0;
+                n++; late_sum += late; if (late > late_max) late_max = late;
+                gw_sum += gw; if (gw > gw_max) gw_max = gw;
+                if (!t_rep) t_rep = tw1;
+                if (tw1 - t_rep >= 5000000ull){
+                    fprintf(stderr, "  [timer] %llu ticks/5s, late mean %.2f max %.1f ms, GIL wait mean %.2f max %.1f ms\n",
+                            (unsigned long long)n, late_sum / 1000.0 / n, late_max / 1000.0,
+                            gw_sum / 1000.0 / n, gw_max / 1000.0);
+                    n = late_sum = late_max = gw_sum = gw_max = 0; t_rep = tw1;
+                }
+            }
             dispatch_indirect(&cpu, proc);
             guest_unlock();
             g_timer_ticks++;
         }
     }
     return 0;
+}
+
+/* ---- TEXT ENTRY: is a game text box taking typed characters? -------------------
+ * The window procedure's WM_CHAR branch (NA 0x005ccf50) calls 0x0055dbd0, which hands
+ * the character to the text box object at 0x0083a7b0 (char handler 0x00551270) only
+ * while byte [0x0083a9c0] is set and dword [0x0083a9c4] is non-zero (profile name,
+ * keyboard screen); otherwise to the menu (0x00558b70).  The iOS shell polls this to
+ * show / hide the system keyboard.  NA addresses; 0 on other builds. */
+int nfs_textbox_active(void){
+#if defined(NFS_EXE_NA) && NFS_EXE_NA
+    if (!g_mem || !mem_is_committed(0x0083a9c7u)) return 0;
+    return MR8(0x0083a9c0u) && MR32(0x0083a9c4u);
+#else
+    return 0;
+#endif
 }
 
 /* ---- registry: in memory, "not found" default ---- */

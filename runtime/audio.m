@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <math.h>
 
 extern uint8_t *g_mem;
@@ -81,7 +83,12 @@ typedef struct {
     uint32_t wr_play;         /* writes since this Play started (>= 8: a streaming buffer) */
     uint64_t muted;           /* output frames muted because the data was stale */
     uint32_t lastblk;         /* block the cursor was in at the end of the last callback */
+    double   cstep;           /* source samples per output frame at the last callback (SMOOTH CURSOR) */
 } SndBuf;
+/* SMOOTH CURSOR: time and length of the last mix, so GetCurrentPosition can move
+ * between callbacks like DirectSound's GETCURRENTPOSITION2 cursor. */
+static _Atomic uint64_t g_mix_t_us;
+static _Atomic unsigned g_mix_frames;
 #define FRESH_SH 8u           /* block = 256 bytes (~1.5 ms of 44.1 kHz stereo 16-bit) */
 
 static SndBuf g_snd[MAXSND];
@@ -110,8 +117,11 @@ int audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
     if (bits != 8u && bits != 16u) bits = 16u;
     pthread_mutex_lock(&g_slock);
     int id = 0;
-    if (g_sndn < MAXSND){
-        id = g_sndn++;
+    /* NOTE: released slots are NOT reused.  With no mixer (NOSOUND=1) the stream
+     * watchdog (0x007260f7) re-creates its buffers endlessly; the 128-slot limit is
+     * what stops that loop harmlessly (slot reuse let it run the buffer heap out). */
+    if (g_sndn < MAXSND) id = g_sndn++;
+    if (id){
         SndBuf *b = &g_snd[id];
         b->data = data; b->bytes = bytes; b->rate = rate;
         b->chans = chans; b->bits = bits;
@@ -119,7 +129,9 @@ int audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
         b->wpos = 0; b->wseen = 0; b->trim = 1.0; b->target = 0.0; b->over = 0;
         b->freq = 1.0; b->plays = b->stops = 0;
         b->wr_bytes = b->wr_calls = b->wr_nonzero = 0;
+        free(b->fresh);
         b->fresh = calloc((bytes >> FRESH_SH) + 1u, 1); b->wr_play = 0; b->muted = 0; b->lastblk = 0xFFFFFFFFu;
+        b->cstep = 0.0;
         fprintf(stderr, "  [sound] buffer #%d: %u Hz, %u channels, %u bits, %u bytes (%.2f s)\n",
                 id, rate, chans, bits, bytes,
                 (double)bytes / (double)(rate * chans * (bits/8u)));
@@ -233,12 +245,35 @@ void audio_stop(int id){
     if (g_snd[id].used){ g_snd[id].playing = 0; g_snd[id].stops++; }
     pthread_mutex_unlock(&g_slock);
 }
+/* the guest released the buffer: the slot can be reused (its data stays: a duplicate may share it) */
+void audio_release(int id){
+    if (id <= 0 || id >= MAXSND) return;
+    pthread_mutex_lock(&g_slock);
+    if (g_snd[id].used){ g_snd[id].playing = 0; g_snd[id].used = 0; }
+    pthread_mutex_unlock(&g_slock);
+}
 /* For the guest's GetCurrentPosition.
  * DirectSound returns two cursors: PLAY and WRITE.  The write cursor is AHEAD
  * of the play cursor (the safe limit the hardware is reading); the game writes
  * data from there on.  Returning both as equal made the game write exactly at
  * the point we were playing, and the sound stuttered "stop-start". */
 #define WRITE_LEAD_MS 50u
+/* iOS: the write lead must cover the device slice (RemoteIO: 1024 frames = 23 ms by
+ * default, vs 512 on the Mac) PLUS the game's own write period (~30 ms, measured:
+ * 2839 writes in 87 s).  With 50 ms the play cursor passed the writer 68 times in
+ * 87 s on the iPad mini 2 and the stale guard muted 11 s of music (the stutter).
+ * SNDLEAD_MS=<ms> overrides; default 100 on iOS, 50 elsewhere. */
+static uint32_t write_lead_ms(void){
+    static uint32_t v = 0;
+    if (!v){ const char *e = getenv("SNDLEAD_MS");
+#if TARGET_OS_IPHONE
+        v = (e && *e) ? (uint32_t)atoi(e) : 100u;
+#else
+        v = (e && *e) ? (uint32_t)atoi(e) : WRITE_LEAD_MS;
+#endif
+        if (v < 10u) v = 10u; if (v > 400u) v = 400u; }
+    return v;
+}
 void audio_cursors(int id, uint32_t *play, uint32_t *write){
     uint32_t p = 0, w = 0;
     if (id > 0 && id < MAXSND){
@@ -246,8 +281,26 @@ void audio_cursors(int id, uint32_t *play, uint32_t *write){
         if (g_snd[id].used && g_snd[id].bytes){
             uint32_t bpf = g_snd[id].chans * (g_snd[id].bits/8u);
             uint32_t sz  = g_snd[id].bytes;
-            p = (uint32_t)(g_snd[id].cursor * (double)bpf) % sz;
-            uint32_t lead = (g_snd[id].rate * WRITE_LEAD_MS / 1000u) * bpf;
+            double cur = g_snd[id].cursor;
+            /* SMOOTH CURSOR: advance by the real time since the last mix (at most one
+             * callback's worth, never past what was mixed ahead of the device).  The
+             * movie player's stream watchdog (0x007260f7) re-initialises DirectSound
+             * when the write cursor reads the same 100 calls in a row -- with a cursor
+             * that only moved per callback it did so endlessly (15,000 buffer re-creates,
+             * buffer heap out of memory, crash on the first video). */
+            if (g_snd[id].playing && g_snd[id].cstep > 0.0){
+                struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                uint64_t now = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+                uint64_t t0 = atomic_load(&g_mix_t_us);
+                if (t0 && now > t0){
+                    double ext = (double)(now - t0) * 1e-6 * (double)OUT_RATE * g_snd[id].cstep;
+                    double cap = (double)atomic_load(&g_mix_frames) * g_snd[id].cstep;
+                    if (ext > cap) ext = cap;
+                    cur += ext;
+                }
+            }
+            p = ((uint32_t)(cur * (double)bpf) % sz) / bpf * bpf;
+            uint32_t lead = (g_snd[id].rate * write_lead_ms() / 1000u) * bpf;
             if (lead >= sz) lead = sz / 4u;
             w = (p + lead) % sz;
         }
@@ -360,6 +413,7 @@ static void mix_into(int16_t *out, unsigned frames){
                     b->target, b->trim, g_rate_ratio);
         }
         double step = (double)b->rate / (double)OUT_RATE * g_rate_ratio * b->trim * b->freq;
+        b->cstep = step;
         active++;
         /* see STALE DATA GUARD */
         int guard = b->fresh && b->loop && b->wr_play >= 8u && stale_guard_on();
@@ -411,6 +465,9 @@ static void mix_into(int16_t *out, unsigned frames){
             }
         }
     }
+    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);   /* see SMOOTH CURSOR */
+      atomic_store(&g_mix_t_us, (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull);
+      atomic_store(&g_mix_frames, frames); }
     pthread_mutex_unlock(&g_slock);
     if (active > g_active_peak) g_active_peak = active;
     g_mixed_frames += frames;

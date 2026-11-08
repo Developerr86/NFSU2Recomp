@@ -6581,6 +6581,18 @@ void metal_run_main_loop(void){
                  * frames (default 8).  The length was needed: without driving the car
                  * we can't see the headlights hit the surface. */
                 autotext_tick(atomic_load(&g_frames_drawn));
+                /* TEXTLOG=1: log when a game text box starts / stops taking typed characters */
+                if (ENVC("TEXTLOG")){ static int was = -1; int nfs_textbox_active(void); int now = nfs_textbox_active();
+                    if (now != was){ was = now; fprintf(stderr, "app: text box %s (frame %ld)\n",
+                                                        now ? "ACTIVE" : "inactive", atomic_load(&g_frames_drawn)); } }
+                /* MOVIESKIP=<frame>[,...] (test): a movie-skip request at that frame, as a tap does on iOS */
+                { static long msf[8]; static int msn = -1, msi = 0;
+                  if (msn < 0){ msn = 0; const char *e = ENVC("MOVIESKIP");
+                      for (const char *q = e; q && *q && msn < 8; ){ msf[msn++] = atol(q);
+                          while (*q && *q != ',') q++; if (*q) q++; } }
+                  if (msi < msn && atomic_load(&g_frames_drawn) >= msf[msi]){
+                      msi++; void fileio_movie_skip(void); fileio_movie_skip();
+                      fprintf(stderr, "app: MOVIESKIP frame %ld\n", atomic_load(&g_frames_drawn)); } }
                 { enum { SQMAX = 64 };
                   static int sqinit = 0; static long sqf[SQMAX], sqd[SQMAX];
                   static unsigned char sqk[SQMAX]; static int sqn = 0;

@@ -144,7 +144,17 @@ static void copy_up(const char *win, const char *wpath){
 /* --- handle table --- */
 #define FH_BASE 0x00900000u
 #define FH_MAX  256
-typedef struct { int fd; int empty; int used; char path[512]; DIR *dir; char pat[128];
+/* MOVIE SKIP: open .vp6 files (except blank.vp6) are counted; a skip request (a tap
+ * on iOS, MOVIESKIP=<frame> in tests) makes their reads return 0 bytes, so the game's
+ * own player reaches end of file and finishes the movie normally.  None of the
+ * keys tried (Enter, Esc, Space, keypad Enter, P) skip the opening FMV. */
+#include <stdatomic.h>
+static _Atomic int g_movie_open = 0, g_movie_skip = 0;
+int  fileio_movie_playing(void){ return atomic_load(&g_movie_open) > 0; }
+/* chunk map of an open movie (EA VP6 container: 4-byte tag + 4-byte LE size) and the
+ * last reads (guest buffer <- file offset), see MOVIE SKIP */
+typedef struct { uint32_t *off; int n; struct { uint32_t buf, foff, len; } rd[16]; int nrd; uint64_t pos; } MovMap;
+typedef struct { int fd; int empty; int used; int movie; MovMap *mm; char path[512]; DIR *dir; char pat[128];
                  DIR *dir2; char path1[512]; } FH;   /* dir2: the game root (while the save layer is active) */
 static FH g_fh[FH_MAX];
 static uint32_t fh_new(void){
@@ -157,6 +167,54 @@ static FH *fh_get(uint32_t h){
     FH *f=&g_fh[h-FH_BASE]; return f->used?f:0;
 }
 int fileio_is_handle(uint32_t h){ return fh_get(h)!=0; }
+
+/* MOVIE SKIP, data side: rewrite the tag of every chunk in [foff, foff+len) that sits
+ * in guest buffer buf to "SCEl" (end of stream), so the player's next parse ends the
+ * movie through its normal end path.  Returning 0 bytes or a read error only froze the
+ * picture: the player reads ~1 MB at a time, short movies are fully in memory after
+ * one read.  Container: 4-byte tag + 4-byte LE size (MVhd, SCHl, MV0K, MV0F, SCDl ... SCEl). */
+static void mov_kill_region(MovMap *m, uint32_t buf, uint32_t foff, uint32_t len){
+    if (!m || !m->off) return;
+    for (int i = 1; i < m->n; i++){                 /* keep the MVhd header (i = 0) */
+        uint32_t o = m->off[i];
+        if (o < foff || (uint64_t)o + 4u > (uint64_t)foff + len) continue;
+        uint32_t a = buf + (o - foff);
+        if (mem_is_committed(a + 3)) memcpy(g_mem + a, "SCEl", 4);
+    }
+}
+static MovMap *mov_map_build(int fd){
+    MovMap *m = calloc(1, sizeof *m); if (!m) return 0;
+    int cap = 1024; m->off = malloc(sizeof(uint32_t) * (size_t)cap);
+    uint64_t o = 0; unsigned char h[8]; struct stat st;
+    if (fstat(fd, &st) != 0){ free(m->off); free(m); return 0; }
+    while (m->off && o + 8 <= (uint64_t)st.st_size){
+        if (pread(fd, h, 8, (off_t)o) != 8) break;
+        uint32_t n = h[4] | (h[5] << 8) | (h[6] << 16) | ((uint32_t)h[7] << 24);
+        if (n < 8 || o + n > (uint64_t)st.st_size) break;
+        if (m->n == cap){ cap *= 2; m->off = realloc(m->off, sizeof(uint32_t) * (size_t)cap); if (!m->off) break; }
+        m->off[m->n++] = (uint32_t)o; o += n;
+    }
+    return m;
+}
+static void mov_note_read(FH *f, uint32_t buf, uint64_t foff, ssize_t got){
+    if (!f || !f->mm || got <= 0 || foff > 0xFFFFFFFFull) return;
+    MovMap *m = f->mm; int k = m->nrd < 16 ? m->nrd++ : (int)(foff / 65536u) % 16;
+    m->rd[k].buf = buf; m->rd[k].foff = (uint32_t)foff; m->rd[k].len = (uint32_t)got;
+    if (getenv("MOVIESKIP_DATA") && atomic_load(&g_movie_skip)) mov_kill_region(m, buf, (uint32_t)foff, (uint32_t)got);
+}
+void fileio_movie_skip(void){
+    if (atomic_load(&g_movie_open) <= 0) return;
+    atomic_store(&g_movie_skip, 1);
+    /* the data rewrite crashed the player (SCEl ends the AUDIO stream; sub_0072248c null
+     * read): experimental only, MOVIESKIP_DATA=1 */
+    if (!getenv("MOVIESKIP_DATA")) return;
+    for (int i = 1; i < FH_MAX; i++){
+        FH *f = &g_fh[i];
+        if (!f->used || !f->movie || !f->mm) continue;
+        for (int k = 0; k < f->mm->nrd; k++)
+            mov_kill_region(f->mm, f->mm->rd[k].buf, f->mm->rd[k].foff, f->mm->rd[k].len);
+    }
+}
 
 static uint32_t A(CPU *c,int i){ return MR32(c->esp + 4u*(uint32_t)i); }
 #define GS(a) ((const char*)(g_mem + (uint32_t)(a)))
@@ -305,6 +363,11 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
             if(!h){ close(fd); r=INVALID_HANDLE; }
             else { FH*f=fh_get(h); f->fd=fd; f->empty = g_empty_next; g_empty_next = 0;
                    snprintf(f->path,sizeof f->path,"%s",real);
+                   { const char *ext3 = strrchr(real, '.'), *bn3 = strrchr(real, '/');
+                     bn3 = bn3 ? bn3 + 1 : real;
+                     f->movie = (ext3 && !strcasecmp(ext3, ".vp6") && strncasecmp(bn3, "blank", 5)) ? 1 : 0;
+                     if (f->movie){ atomic_fetch_add(&g_movie_open, 1); atomic_store(&g_movie_skip, 0);
+                                    f->mm = mov_map_build(fd); } }
                    g_file_open++; r=h; }
         }
     }
@@ -322,6 +385,7 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
                    uint64_t off = (uint64_t)MR32(ov+8) | ((uint64_t)MR32(ov+12) << 32);
                    got = pread(f->fd, g_mem+buf, len, (off_t)off);
                    if(got<0) got=0;
+                   if (f->movie) mov_note_read(f, buf, off, got);             /* see MOVIE SKIP */
                    MR32(ov+0) = 0;                      /* Internal = STATUS_SUCCESS */
                    MR32(ov+4) = (uint32_t)got;          /* InternalHigh = bytes read */
                    uint32_t hev = MR32(ov+16);
@@ -337,8 +401,10 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
                } else if (f->empty){
                    got = 0;                       /* immediate end of file */
                } else {
+                   off_t pos0 = f->movie ? lseek(f->fd, 0, SEEK_CUR) : 0;
                    got = read(f->fd, g_mem+buf, len);
                    if(got<0) got=0;
+                   if (f->movie && pos0 >= 0) mov_note_read(f, buf, (uint64_t)pos0, got);   /* see MOVIE SKIP */
                }
                /* MUTEFILE=<substring>: fill the reads of the matching file with ZEROS.
                 * To measure objectively whether sound effects remain once the
@@ -360,7 +426,8 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
                            audio_time(), bn, len, (long)got,
                            (double)(now_ns_io() - _rd0)/1e6);
                }
-               g_file_read++; g_bytes_read += (uint64_t)got; r=1; }
+               g_file_read++; g_bytes_read += (uint64_t)got; r=1;
+               }
     }
     else if (!strcmp(n,"GetOverlappedResult")){
         /* (hFile, lpOverlapped, lpNumberOfBytesTransferred, bWait) */
@@ -401,6 +468,9 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
         if(!f) return 0;                       /* not ours - let the other layer look */
         if(f->fd>=0) close(f->fd);
         if(f->dir) closedir(f->dir);
+        if (f->mm){ free(f->mm->off); free(f->mm); f->mm = 0; }
+        if (f->movie){ f->movie = 0;
+            if (atomic_fetch_sub(&g_movie_open, 1) <= 1){ atomic_store(&g_movie_open, 0); atomic_store(&g_movie_skip, 0); } }
         f->used=0; r=1;
     }
     else if (!strcmp(n,"GetFileAttributesA")){
