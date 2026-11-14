@@ -1,417 +1,219 @@
+# Need for Speed: Underground 2 on iOS — native port for the iPad mini 2
 
+**The original PC *Need for Speed: Underground 2* (2004), recompiled to native ARM64
+and running on a jailbroken iPad mini 2 (A7, 1 GB RAM, iOS 12.5.8).** No emulator,
+no JIT, no Wine: the game's own code, with Direct3D 9 translated to Metal.
 
-https://github.com/user-attachments/assets/f58f98bd-ca90-48fa-9a7d-5d056cf0cbbb
+This is the `ios` branch of a fork of [NFSU2Recomp](https://github.com/TalhaMudo/NFSU2Recomp),
+Talha Müderrisoğlu's native Apple Silicon **macOS** port. The recompiled game code is
+the same as the macOS build of the North American v1.2 `SPEED2.EXE`. This branch
+replaces the platform layer for iOS: UIKit app shell, touch controls, A7 GPU limits,
+memory, audio, storage. All iOS changes are behind `TARGET_OS_IPHONE`, so the macOS
+build still works (see [The macOS port](#the-macos-port)).
 
-# Need for Speed: Underground 2 on Mac — native Apple Silicon port, no Wine
+> **This repository contains no game code and no game assets.** You need your own
+> copy of the PC game. The C code generated from its executable (`gen/`), every build
+> (`out/`) and the game data never go into git.
 
-> **iOS port (this fork, branch `ios`):** the game runs on a jailbroken **iPad mini 2**
-> (A7, 1 GB RAM, iOS 12): a stable 60 fps on low settings, about 30 fps (dipping towards 20)
-> maxed out. More optimisation is coming, and the iPhone SE (2016) is the next device
-> to test. Details, build steps and status: [`ios/README.md`](ios/README.md).
+![Race on the iPad mini 2](screenshots/selected/ios_ipad_mini2_race.jpg)
 
-**Play *Need for Speed: Underground 2* (NFSU2, 2004) natively on Apple Silicon
-Macs (M1 and later): no Wine, no CrossOver, no emulator, no virtual machine.**
+![The garage on the iPad mini 2](screenshots/selected/ios_ipad_mini2_garage.jpg)
 
-NFSU2Recomp is a static recompiler and runtime that turn the original Windows PC
-executable of the game (`SPEED2.EXE`, 32-bit x86, Direct3D 9) into a **native
-ARM64 macOS app**. The game's x86 machine code is lifted to C ahead of time and
-compiled with clang; Direct3D 9 is translated to Metal, DirectSound to
-CoreAudio. There is no Wine, no emulator, no JIT and no Windows involved at run
-time. On an M1 Pro, races run at **119 fps** (the display's limit), against
-**10–15 fps** for the same game under Wine.
-
-> **This repository contains no game code and no game assets.** It contains the
-> recompiler and the runtime only. You need your own copy of the game. The C
-> code generated from its executable is never committed. The prebuilt app on
-> the [Releases page](https://github.com/TalhaMudo/NFSU2Recomp/releases/latest) contains the recompiled program but no game files:
-> on first launch you point it at your own installation.
-
-![Race, native ARM64 build](screenshots/selected/27_20260924_current-race.jpg)
+*Screenshots taken on the iPad mini 2: a career race with the on-screen controls,
+and the garage.*
 
 ## Status
 
-The game boots, reaches the menus, and races are playable with sound.
+**The full game runs on the iPad mini 2:** boot, intro movies, menus, career mode
+(free roam, races, shops, saves) and Quick Race, with sound, touch controls and the
+original rendering.
 
 | Area | State |
 |---|---|
-| x86-32 → C lifter (integer, x87, MMX, SSE/SSE2, 3DNow!, string ops) | 23,278 functions, 137 MB of generated C |
-| Win32 layer (CRT startup, heap, TLS, threads, files, registry, window) | working |
-| Direct3D 9 → Metal, shader bytecode (vs/ps 1.x–2.x) → MSL | working |
-| DirectSound → CoreAudio, DirectInput (keyboard, mouse) | working |
-| Windowed, fullscreen, Retina-native and 1080p widescreen | working |
-| Career mode: profile creation (name entry), save and load | working |
-| Double-clickable `.app` with a launcher window (`./pack.sh`) | working |
-| Optional "HD" build: MSAA (2× at 1440 lines and above, 4× below), SSR, ray-traced reflections | working, see `GRAPHICS_RESEARCH.md` |
+| Frame rate | **Stable 60 fps on low settings**; about 30 fps, dipping towards 20, with everything maxed out. Menus: 60 fps. |
+| Memory | Peak 376–425 MB in scripted races (budget: under 450 MB; the first build used 570 MB). Long free-roam sessions have reached ~490–500 MB, which is being worked on. |
+| Game data on the device | 1.7 GB with movies, down from 2.2 GB, using lossless compression (`ios/pack_data.py`). Loads are faster too. |
+| Movies | Play with the game's own VP6 decoder; tap to skip the ones the game lets you skip. |
+| Sound | Music and effects without stutter. |
+| Controls | Touch acts as the mouse in menus. On-screen steering, gas, brake, e-brake, N2O, Esc and Enter are always there. **Gear ▲/▼** appear in drag races or with manual transmission. **Map** and **SMS** appear while driving. MFi controllers are supported. |
+| Text entry | The iOS keyboard comes up for the profile name. |
+| Device | iPad mini 2 tested. The **iPhone SE (2016)** (A9, 2 GB) is the next device. |
 
-### Known limitations
+More optimisation is on the way: render-pass and bandwidth work for the tile-based GPU,
+textures and memory.
 
-- **Two builds of `SPEED2.EXE` are supported**, the European and the North
-  American v1.2 ones (see [Game versions](#game-versions)); each has its own
-  engine. Other builds would need their own lifting pass and address map.
-- Videos are skipped: there is no VP6 decoder.
-- Keyboard and mouse only; no gamepad or wheel support. No network play.
-- Structured exception handling is not implemented (`RtlUnwind` /
-  `RaiseException` are stubs).
-- x87 is modelled with 64-bit doubles, not 80-bit extended precision.
-- One workaround with an unknown root cause remains: the front end's
-  world-view-projection matrix arrives broken and an identity matrix is injected
-  instead (`FIXMAT`, see `run.sh`).
-- About 310 instructions in rarely used opcodes (many of them data the
-  disassembler mistook for code) are still emitted as traps. None are hit in the
-  measured race scene.
-- Some visuals are unverified against a Windows reference (crowds / skinned
-  meshes). See "Remaining graphics items" in `PROJECT.md`.
-- Under investigation: in career mode, the scene behind the post-race results
-  panel (car pulling up, crowd) can stay black; the same scene renders
-  correctly after a Quick Race drag.
+### Known issues
+
+- Car showroom loading hang: a fix (the game clock kept moving through long loads)
+  is installed and being verified.
+- Memory can pass 450 MB in long free-roam sessions (open-world textures).
+- Rootful jailbreak required: the app needs entitlements a normal sideload cannot
+  give it, and the device must have SSH.
+- The macOS port's limitations also apply (see [The macOS port](#the-macos-port)).
+
+## What the iOS port changes
+
+The full table is in [`ios/README.md`](ios/README.md). In short:
+
+- **App shell.** UIKit owns the main thread. The original boot code runs on its own
+  thread and starts the game thread (1 GB stack), then runs the Metal frame loop.
+- **Guest memory.** The game's 4 GB address space is a zero-fill section inside the
+  executable. With iOS's default 4 GB `__PAGEZERO` there isn't enough contiguous
+  space, and a smaller pagezero clashes with the jailbreak's injected library.
+- **A7 GPU (Metal family 1).** There is no BC texture support, so DXT is decoded on
+  upload (DXT1 to 16-bit). Large mip levels are dropped. Base vertex and mirror-clamp
+  are emulated.
+- **Memory.** Textures are freed when the game releases them. DXT data is dropped
+  from guest memory after upload. Free guest pages go back to the OS, and
+  quarantines are smaller.
+- **Audio and scheduling.** RemoteIO output and a smooth DirectSound play cursor. A
+  fair (FIFO) game lock and a high-priority timer thread fixed music cutting out.
+- **Movies.** EA's CPU-speed probe and movie audio watchdog needed real time and a
+  moving play cursor. A tap acts as Enter.
+- **Input.** On-screen keys send DirectInput scan codes. The gear, map and SMS keys
+  read the game's own active key bindings. The drag-race and manual-transmission
+  checks use the same game settings that pick the drag HUD and the Transmission
+  option.
+- **Data.** `ios/pack_data.py` stores the files that compress well as NFZ1 (128 KB
+  LZFSE blocks). `runtime/fileio.c` reads them transparently.
+- **Lifecycle.** The frame loop pauses in the background. A battery guard exits at
+  < 8 % unplugged or < 5 % charging, because a flat battery reboots the device and
+  loses the jailbreak. A watchdog writes a hang report after 20 s without a frame,
+  and a three-finger tap writes one on demand.
+
+## Requirements
+
+- A jailbroken 64-bit iOS device (rootful; tested: iPad mini 2 on iOS 12.5.8) with SSH
+  and `uicache`. Set up an SSH host alias for it (the scripts default to `ipadmini2`).
+- A Mac with Xcode (iOS SDK), `ldid` (Homebrew) and Python 3 with `capstone` 5.x and
+  `pefile` (`requirements.txt`).
+- Your own copy of the PC game with the **North American v1.2** `SPEED2.EXE`
+  (4,800,512 bytes, SHA-256
+  `f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7`). The app
+  checks it at startup. The US v1.0 disc executable is copy-protected and cannot be
+  used, and this project does not remove copy protection.
+
+## Build and install
+
+Run everything from the repository root.
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+GAME="/path/to/Need for Speed Underground 2"        # folder containing SPEED2.EXE
+
+tools/gen_v2.sh "$GAME/SPEED2.EXE"           # lift the NA exe to C -> gen/na
+ios/build_ios.sh                             # shards + runtime -> out/ios/NFSU2.app
+python3 ios/pack_data.py "$GAME"             # smaller, lossless copy of the data -> out/ios-data
+ios/push_data.sh out/ios-data ipadmini2      # resumable copy to /var/mobile/Media/NFSU2
+ios/install.sh ipadmini2                     # staged install into /Applications + uicache
+ssh ipadmini2 uiopen -b com.legacylab.nfsu2  # or tap the icon
+```
+
+- `ios/build_ios.sh rt` rebuilds only the runtime once the shards are built.
+- **`ios/pack_data.py`** only reads your game folder. It writes a full copy in which
+  track world data, car and wheel models, front-end and cutscene files are compressed
+  without loss, and checks that every packed file decompresses to the original. The
+  other files are APFS clones, so the copy costs almost no space on the Mac. Music,
+  movies, vinyls and speech are already compressed and stay as they are.
+  2.07 GB becomes 1.64 GB. Pushing the unpacked game folder works too.
+- The app icon is generated at build time from `ICON=<square image>`. No logo is
+  committed.
+- `out/ios/NFSU2.dSYM` symbolicates device crash reports.
+- Re-sign with `ldid -Sios/entitlements.plist -Icom.legacylab.nfsu2`. Without `-I`
+  the app gets a new, empty data container.
+
+### Playing
+
+- Game data, saves, the log (`nfsu2.log`) and `env.txt` are in
+  `/var/mobile/Media/NFSU2`.
+- `env.txt` holds `KEY=VALUE` overrides, one per line. Examples:
+  - `NFSRES=1024x768` (render size)
+  - `NFSU2_GEARKEYS=1` (always show the gear keys)
+  - `NFSU2_KEY_GAS=0xC8` (remap an on-screen key, DIK hex)
+  - `NOMOVIES=1`
+
+  The full list is in [`ios/README.md`](ios/README.md).
+- If the game hangs, tap the screen with three fingers; a report goes to
+  `nfsu2.log`.
 
 ## How it works
 
 ```
 SPEED2.EXE (PE32, x86)
-   │  tools/reloc2.py     recover the relocation table  → out/relocs.txt
+   │  tools/reloc2.py     recover the relocation table
    │  tools/genall.py     recursive-descent discovery + tools/lift.py
    ▼                      x86 → C, one C function per guest function
-gen/all/shard_*.c  (128 files) + fntab.c (guest address → native function)
-   │  build.sh            clang -O3, in parallel
+gen/na/shard_*.c + fntab.c (guest address → native function)
+   │  ios/build_ios.sh    clang -O2 -mcpu=cyclone, arm64-apple-ios12.0
    ▼
-runtime/  (hand-written)  CPU state, guest memory, Win32, D3D9→Metal, audio
-   │  link.sh
+runtime/  (hand-written)  CPU state, guest memory, Win32, D3D9→Metal, audio,
+   │                      ios_app.m (UIKit shell), bundle_ios.m (paths)
    ▼
-out/nfsu2_boot            ~35 MB arm64 Mach-O
+out/ios/NFSU2.app         ~33 MB arm64 executable + the 4 GB zero-fill guest section
 ```
 
-- **Pointers vs. constants.** The hard problem of x86 static recompilation is
-  telling a 4-byte address from a 4-byte number. This executable has its
-  relocation *directory entry* zeroed, but the relocation *data* is still
-  physically present in an unnamed section. `tools/reloc2.py` parses it by hand:
-  91,106 absolute addresses, all of which point into the image. Function
-  discovery and jump-table recovery are seeded from it.
-- **Guest memory.** The 32-bit guest address space is reserved with `mmap`;
-  guest→host translation is a single ARM64 addressing mode
-  (`ldr w8, [x_base, w_addr, uxtw]`).
+- **Pointers vs. constants.** The hard part of x86 static recompilation is telling a
+  4-byte address from a 4-byte number. The executable's relocation directory entry
+  is zeroed, but the relocation data is still there; `tools/reloc2.py` parses it by
+  hand (91,106 absolute addresses), and function discovery and jump tables are
+  seeded from it.
+- **Guest memory.** One 32-bit address space; translating a guest address to a host
+  one is a single ARM64 addressing mode.
 - **Indirect calls** go through an O(1) table indexed by guest address.
-- **Code generated at run time.** The game writes small x86 thunks to its stack
-  and calls them. `runtime/genexec.c` detects these and runs them in a small
-  interpreter, handing calls back to lifted functions.
-- **D3DX effects.** The statically linked D3DX9 effect framework took ~47% of
-  guest time when executed as lifted code; `runtime/d3dx_hle.c` short-circuits
-  parts of it (`D3DX_HLE.md`).
+- **Code generated at run time** (small x86 thunks the game writes to its stack)
+  runs in a small interpreter (`runtime/genexec.c`).
+- **D3DX effects** are partly replaced by hand-written code (`runtime/d3dx_hle.c`,
+  `D3DX_HLE.md`).
 
 | Path | What it is |
 |---|---|
-| `tools/lift.py` | x86-32 → C lifter, with lazy EFLAGS (flag liveness) |
-| `tools/genall.py` | function discovery, parallel generation, sharding |
-| `tools/reloc2.py` | relocation table recovery |
-| `tools/argcount.py` | stdcall argument counts for imports |
-| `tools/isatest.py`, `tools/fuzzisa.py` | instruction-semantics tests and differential fuzzer |
+| `ios/` | iOS build, install, data packing and push scripts; `ios/README.md` |
+| `runtime/ios_app.m`, `bundle_ios.m` | UIKit shell, touch controls, paths and defaults |
+| `runtime/metal.m` | Direct3D 9 → Metal renderer (A7 paths under `TARGET_OS_IPHONE`) |
+| `runtime/com.c`, `vsemu.c` | Direct3D 9 / DirectInput / DirectSound COM layer, shader translation |
+| `runtime/audio.m` | CoreAudio output (RemoteIO on iOS) |
+| `runtime/win32.c`, `win32_ext.c`, `fileio.c`, `res.c` | Win32 API layer (`fileio.c` also reads NFZ1 packed files) |
 | `runtime/cpu.h`, `mem.c`, `dispatch.c`, `genexec.c` | CPU state, guest memory, dispatch, run-time code |
-| `runtime/win32.c`, `win32_ext.c`, `fileio.c`, `res.c` | Win32 API layer |
-| `runtime/com.c`, `metal.m`, `vsemu.c` | Direct3D 9 / DirectInput / DirectSound COM layer, Metal renderer, shader translation |
-| `runtime/audio.m` | CoreAudio output |
-| `runtime/overrides.c`, `d3dx_hle.c` | hand-written replacements for specific game functions |
-| `runtime/enhance.c` | HD build only (`-DNFS_ENHANCED=1`) |
-| `runtime/bundle.m`, `pack.sh` | `.app` behaviour and packaging |
-| `launcher/*.swift` | the app's launcher window (Swift/SwiftUI): finds and checks the game, Original/HD, portable copy |
+| `tools/lift.py`, `genall.py`, `reloc2.py` | x86-32 → C lifter, function discovery, relocation recovery |
 | `tests/boot.c` | program entry point (runs the game from its PE entry point) |
 
-## Verification
+## The macOS port
 
-- **Instruction semantics:** 169 hand-written tests, 439 checks
-  (`tools/isatest.py` → `out/isatest`).
-- **Differential fuzzing against real x86:** `tools/fuzzisa.py` assembles random
-  instruction sequences, runs them as real x86-64 code under Rosetta 2 and as
-  lifted C on ARM64, and compares registers, flags and memory.
-- **Function-level tests:** 15 checks against lifted game functions
-  (`out/nfsu2_all`).
-- **Reproducible generation:** the generated C is a pure function of the
-  executable and the tools; regenerating gives byte-identical output.
-
-`./run.sh test` runs the first and third.
-
-- **Integrity run:** `tools/check.sh` plays both builds invisibly and silently
-  from the menus into a Quick Race (~1.5 min each) and checks the end-of-run
-  report: no unsupported instructions, no unresolved indirect calls, no broken
-  matrices, no GPU command buffer errors, no missing mip levels, the race was
-  actually reached, and in the HD build that ray tracing and the separate
-  G-buffer pass ran.  Settings are restored and saves go to a temporary folder.
-
-## Performance
-
-Measured on an M1 Pro at 1280×960, same scene and settings, alternating runs
-(method, raw numbers and caveats in `WINE_COMPARISON.md`):
-
-| | This port | Wine 11.18 (wined3d, Rosetta 2) |
-|---|---|---|
-| Race | 119 fps (capped by the 120 Hz display) | 10–15 fps |
-| 3D menus | 119 fps | 45 fps |
-| CPU time per frame | ~12.6 ms | ~105 ms |
-
-Power while racing at the display's native resolution (3024×1964, 120 fps,
-M1 Pro, `powermetrics`, a real play session): the standard build draws about
-**6.5 W** for CPU + GPU, stays at or below 70 °C and never spins the fans; the
-HD build draws about 18 W.
-
-## Requirements
-
-- Apple Silicon Mac, macOS 11 or later. Developed on an M1 Pro, macOS 27.
-- Xcode Command Line Tools (`clang`; `swiftc` for the launcher window).
-- Python 3 with `capstone` 5.x and `pefile` (`requirements.txt`).
-- Rosetta 2, only for `tools/fuzzisa.py`.
-- Your own installation of the game, with one of these executables (both v1.2
-  without the CD check, built Feb 9 2005):
-
-  | Build | `SPEED2.EXE` size | SHA-256 |
-  |---|---|---|
-  | **European** (PAL) v1.2 | 4,788,224 bytes | `8f6a9ae2c4cfa01181d2fd755d99c6f4b7103f60273908ea1de1e719dfe2a297` |
-  | **North American** v1.2 | 4,800,512 bytes | `f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7` |
-
-  The app checks the file at startup, picks the matching engine and says so
-  instead of crashing on any other file; `NFSU2_ANY_EXE=1` skips the check.
-
-### Game versions
-
-The recompiled code belongs to one executable, so every build of `SPEED2.EXE`
-gets its own lifting pass and engine. The game *data* is a separate matter (see
-the note under the table).
-
-| `SPEED2.EXE` | Size | SHA-256 | Status |
-|---|---|---|---|
-| European v1.2, no CD check | 4,788,224 | `8f6a9ae2c4cfa01181d2fd755d99c6f4b7103f60273908ea1de1e719dfe2a297` | **Supported** (the reference build) |
-| North American v1.2, no CD check (the build most PC mods target) | 4,800,512 | `f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7` | **Supported** (engines `nfsu2-engine-na`, `-na-hd`). Tested on US disc data from the menus into a Quick Race, original and HD. |
-| US v1.0 retail disc | 5,987,981 | `2cbd698fee8338a13d1891bc17d27e6641b4b9dd40580de818594b9140222899` | **Cannot be supported.** Protected by SafeDisc: the code section is encrypted on disc and only decrypted at run time, so there is nothing to recompile. |
-
-The retail disc executable carries the disc's copy protection, and the official
-v1.2 patch most likely keeps it (not verified here). A static recompiler needs
-readable machine code, so the port cannot use a protected executable, and this
-project does not remove copy protection.
-
-**Data from the discs.** The US discs and the European release share 1,218 of
-their ~1,250 files byte for byte. The differences are the region's cars (the US
-release has `CARS/CIVIC` and `CARS/RSX`; the European one has `CARS/CORSA` and
-`CARS/PEUGOT106`), the per-language movies, `FRONTEND/FrontB.lzc` and
-`server.dll`.
-
-**US data works with the supported executable.** The game's region is a
-constant in the executable (`0` in the US build, `6` in the European one), and
-it decides which of the region-only cars exist. Left at the European value, US
-data hangs on the "Loading" screen as soon as a race picks a Corsa or a 106. The
-runtime therefore looks at the data at startup: if `CARS/CIVIC` and `CARS/RSX`
-are there but `CARS/CORSA` and `CARS/PEUGOT106` are not, it switches the game to
-the US region (log line `region: North American data`). Tested on US disc data:
-races load, the Civic is in the Quick Race car list and the Mazda is called
-Miata, as in the US release; the region check hides the Corsa and 106.
-`NFSU2_REGION=na` or `eu` forces either region.
-
-### Installing from the PC discs on a Mac
-
-The discs hold the game in plain zip files, so the Windows installer is not
-needed. With the two disc images (`.cue`/`.bin`, `.iso`, or the disc folders):
+This fork keeps the upstream macOS port intact. On Apple Silicon Macs it runs races
+at 119 fps on an M1 Pro (the display's limit), against 10–15 fps under Wine. It has
+a launcher app, an optional HD build (MSAA, SSR, ray-traced reflections), and
+supports both the European and North American v1.2 executables.
 
 ```bash
-brew install sevenzip     # only needed for .bin/.iso images
-python3 tools/install_from_discs.py ~/Games/NFSU2 "Disc 1.cue" "Disc 2.cue"
+tools/gen_v2.sh "/path/to/NA/SPEED2.EXE"     # -> gen/na
+BUILD=na ./build.sh && BUILD=na ./link.sh    # -> out/nfsu2_na_boot, out/nfsu2_na_hd_boot
+./run.sh                                     # windowed
+./pack.sh                                    # out/NFSU2.app (launcher + engines)
 ```
 
-This writes a normal game folder (about 1.7 GB) that the launcher can point at.
-It copies the disc's `SPEED2.EXE` too, but see the table above: the disc
-executable cannot run, so put a supported one in its place. The North American
-v1.2 executable is the natural match for US disc data; the European one also
-works with it (see "US data works with the supported executable" above).
+For the macOS port's full documentation (status, game versions, installing from the
+PC discs, performance, the launcher, FAQ), see the
+[upstream README](https://github.com/TalhaMudo/NFSU2Recomp#readme). Engineering notes
+are in `PROJECT.md`, `D3DX_HLE.md`, `GRAPHICS_RESEARCH.md`, `LIFTER_EFFICIENCY.md`,
+`WINE_COMPARISON.md` and `LITERATURE.md`.
 
-### How the North American build is made
-
-The European executable is the reference: the runtime was written against it.
-`tools/addrmap.py` matches the two executables function by function (a byte
-signature with the parts that move between builds masked, aligned in order) and
-collects data-address pairs from the matched code: 23,276 of 23,277 functions
-match, most code is 16 bytes away from the European build, most data is at the
-same address. Every game address in the runtime is written as `GA(0x…)` in
-European terms; for the North American engine `runtime/build_na.h` (generated
-from the map) turns each one, and each `sub_XXXXXXXX` name the runtime uses, into
-the North American one. An address the map cannot place stops the build.
-
-Two things differ at run time:
-
-- The North American no-CD executable still looks for a CD-ROM drive (its disc
-  contents check is patched out, the drive check is not) and otherwise asks for
-  "Disc 2" forever. Its engine reports `D:` as an empty CD-ROM drive; paths on
-  `D:` resolve to the game folder like those on `C:`.
-- Its region variable is in `.bss` (0, the US) rather than a constant, see
-  "US data works with the supported executable".
-
-Function discovery missed eight call targets in this executable (its linear scan
-stops on bytes an earlier, misaligned scan covered), which became traps;
-`LIFT_MISSING=1` (set by `tools/gen_v2.sh` for this build) lifts such targets in
-extra shards.
-
-## Build and run
-
-Run everything from the repository root.
-
-```bash
-export NFSU2_DATA="/path/to/Need for Speed Underground 2"   # folder containing SPEED2.EXE
-EXE="$NFSU2_DATA/SPEED2.EXE"
-
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-
-# 1) relocation table, cross-function flag liveness, lifting every function
-#    to C, import argument table -> gen/all/   (~1 min on an M1 Pro)
-#    The script holds the OVERRIDE list (functions that runtime/overrides.c and
-#    runtime/d3dx_hle.c replace); it must match them or the link fails.
-tools/gen_v2.sh "$EXE"
-
-# 2) compile the shards, then build the runtime and link   (~1.5 min)
-./build.sh && ./link.sh
-
-./run.sh test        # ISA + function tests
-./run.sh             # windowed
-./run.sh 1080p       # 1920x1080, widescreen-corrected
-./run.sh hd          # HD build
-./pack.sh            # out/NFSU2.app: launcher + both engines (Original and HD)
-./pack.sh --zip      # also out/NFSU2.zip for a release
-./pack.sh --embed    # out/personal/NFSU2.app with your game inside (do not share)
-```
-
-For the North American v1.2 executable the same steps build a second pair of
-engines; `tools/gen_v2.sh` recognises the file by its SHA-256 and writes `gen/na`,
-`run.sh` picks the engine by the executable, and `pack.sh` adds the engines to the
-app when they are built:
-
-```bash
-tools/gen_v2.sh "/path/to/NA/SPEED2.EXE"       # -> gen/na
-BUILD=na ./build.sh && BUILD=na ./link.sh       # -> out/nfsu2_na_boot, out/nfsu2_na_hd_boot
-```
-
-`runtime/build_na.h` is committed. `link.sh` regenerates it from
-`out/na/addrmap.json` when that file exists, which takes both executables:
-`tools/addrmap.py build <European SPEED2.EXE> <North American SPEED2.EXE> out/na/addrmap.json`.
-Do this after adding a `GA(...)` address or a `sub_` name to the runtime; game
-addresses written without `GA(...)` would be wrong in the North American engine.
-
-The app opens a small launcher window first (`launcher/`, built by `pack.sh`
-with `swiftc`): it finds and checks `SPEED2.EXE`, offers Original or HD graphics
-and full screen, opens the saves and logs folders, and **Make Copy…** builds a
-portable app with the game files inside (APFS clones, seconds on the same disk),
-so nobody needs `pack.sh --embed` or a terminal for that. Untick "Show this
-window when the app opens" to go straight into the game (hold Option to get the
-window back). `NFSU2_SKIP_LAUNCHER=1` / `NFSU2_ENGINE=original|hd` do the same
-from scripts.
-
-![Launcher window](screenshots/selected/launcher.png)
-
-`run.sh` documents the environment switches; most are diagnostics.
-
-While playing, **Cmd+Shift+D** writes the next frame as a PNG plus the full
-draw list (to `~/Library/Logs/NFSU2/`), for reporting rendering problems.
-`tools/session.sh [hd]` records a play session (frame times, CPU/GPU power,
-temperature, fan speed, screenshots) and `tools/session_report.py` turns it into
-a report.
-
-## FAQ
-
-**Can I play Need for Speed: Underground 2 on a Mac?**
-Yes, on an Apple Silicon Mac (M1 or later) with your own copy of the PC game.
-Download `NFSU2.zip` from the [Releases page](https://github.com/TalhaMudo/NFSU2Recomp/releases/latest), or build the port as
-described above (`./pack.sh` produces a double-clickable `NFSU2.app`). Open it,
-choose the game folder once, click Play. Menus, races, career saves and sound
-work.
-
-**Do I need Wine, CrossOver, Whisky, Parallels or a virtual machine?**
-No. The game's code is recompiled to native ARM64 and runs directly on macOS.
-Rosetta 2 is not used to run the game (only, optionally, by one test tool).
-
-**Is it faster than Wine or CrossOver?**
-On an M1 Pro at 1280×960: 119 fps in races (capped by the 120 Hz display)
-against 10–15 fps under Wine 11.18 with Rosetta 2, and 119 fps against 45 fps
-in the 3D menus. Method and raw numbers are in `WINE_COMPARISON.md`.
-
-**Is there a ready-made download?**
-Yes: the [Releases page](https://github.com/TalhaMudo/NFSU2Recomp/releases/latest) has `NFSU2.zip`. The app holds both
-graphics modes, Original and HD (MSAA, ray-traced reflections), chosen in its
-window; older releases had a separate `NFSU2.HD.zip`. It contains no game files:
-the window asks for the folder that holds your own `SPEED2.EXE`.
-The app is not notarized, so macOS blocks the first start: open System Settings ›
-Privacy & Security and click **Open Anyway** (on macOS 14 and older: right-click
-the app › Open). If macOS says the app is damaged, run once in Terminal:
-`xattr -dr com.apple.quarantine /Applications/NFSU2.app`
-
-**Can I carry the game to another Mac in one piece?**
-Yes. In the app's window, **Make Copy…** creates "NFSU2 Portable.app" with the
-game files inside (about 1.4 GB). It runs on its own; saves stay in
-`~/Library/Application Support/NFSU2 Saves` on each Mac. It contains the game,
-so keep it for yourself.
-
-**Which version of the game does it need?**
-The Windows PC version, with the European or the North American v1.2
-`SPEED2.EXE` listed under [Requirements](#requirements). The US v1.0 disc
-executable cannot be supported (it is copy-protected). Console versions are not
-supported. See [Game versions](#game-versions).
-
-**I only have the PC discs. Can I install them on a Mac?**
-Yes, without Windows: `tools/install_from_discs.py` unpacks the disc images
-into a game folder. See [Installing from the PC discs on a
-Mac](#installing-from-the-pc-discs-on-a-mac).
-
-**Does it work on Intel Macs?**
-No. Only Apple Silicon is targeted and tested.
-
-**What does not work yet?**
-Videos are skipped, there is no gamepad or wheel support and no online play.
-See [Known limitations](#known-limitations).
-
-**How is this different from other NFSU2 projects?**
+**Related projects**
 
 | Project | Approach | Platforms |
 |---|---|---|
-| **NFSU2Recomp** (this) | Recompiles the PC executable with its own x86 → C lifter; own Direct3D 9 → Metal renderer | macOS (Apple Silicon) |
-| [OpenUG2](https://github.com/whoismept/OpenUG2) | Reimplements the engine from scratch and reads the game's data files; does not run the original code | Linux, macOS, Windows |
+| [NFSU2Recomp](https://github.com/TalhaMudo/NFSU2Recomp) (upstream) | Recompiles the PC executable with its own x86 → C lifter; own Direct3D 9 → Metal renderer | macOS (Apple Silicon) |
+| **NFSU2Recomp `ios`** (this fork) | The same recompiled code with an iOS platform layer | iOS 12+ (jailbroken), iPad mini 2 |
+| [OpenUG2](https://github.com/whoismept/OpenUG2) | Reimplements the engine from scratch and reads the game's data files | Linux, macOS, Windows |
 | [nfsu2-recompiled](https://github.com/codepdbh/nfsu2-recompiled) | Recompiles the PC executable with pcrecomp; Direct3D 9 through DXVK | Windows, Android |
 | [nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw) | Recompiles the original Xbox version with xboxrecomp | Nintendo Switch, Linux |
 
-## Related work
-
-Static recompilation of x86 is not new, and this is not the first project to do
-it:
-
-- [M-HT/SR](https://github.com/M-HT/SR) statically recompiles DOS and Windows
-  game executables (Septerra Core, Battle Isle 3 and others) at assembly level,
-  for targets including macOS arm64.
-- [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp) lifts original
-  Xbox (x86) games to C with a Python + Capstone pipeline very similar to this
-  one.
-- [N64: Recompiled](https://github.com/N64Recomp/N64Recomp) and
-  [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) established the
-  approach for MIPS and PowerPC consoles, and are where the method here comes
-  from.
-- McSema, rev.ng, RetDec and BinRec are IR-based binary lifters from the research
-  side.
-
-What this project adds is narrower: recovering a relocation table whose
-directory entry was zeroed and using it to separate pointers from constants; a
-differential instruction fuzzer that uses Rosetta 2 as the oracle; a hybrid
-interpreter for x86 code the game generates at run time; and an end-to-end,
-playable Win32 + Direct3D 9 → macOS ARM64 + Metal port of a 23,000-function 3D
-game.
-
-## Documentation
-
-- `PROJECT.md` — chronological engineering log: findings, bugs and root causes,
-  measurements.
-- `D3DX_HLE.md` — high-level emulation of the D3DX effect framework.
-- `GRAPHICS_RESEARCH.md` — graphics research and the HD build.
-- `LIFTER_EFFICIENCY.md` — lifter efficiency work and measurements.
-- `WINE_COMPARISON.md` — comparison against Wine.
-- `LITERATURE.md` — related work.
-- `screenshots/report/nfsu2-report.html` — illustrated project report.
-
 ## How this was built
 
-Development was carried out with an AI coding assistant (Claude Code) under the
-direction of the project owner. Goals, constraints and priorities, observations
-from playing the game, Windows reference material and direction decisions came
-from the project owner; implementation, measurement and debugging were done
-together with the assistant.
+The upstream macOS port was developed with an AI coding assistant (Claude Code)
+under the direction of its owner. The iOS port in this fork was done the same way:
+goals, priorities, play-testing on the device and direction came from the fork's
+owner; implementation, measurement and debugging were done together with the
+assistant.
 
 ## Legal
 
@@ -424,7 +226,7 @@ fork or build of it — and any commercial use require prior written
 permission. See `LICENSE`.
 
 **Permission:** to publish, share or build on this code, ask first by opening
-an issue in this repository.
+an issue in the upstream repository.
 
 This project is not affiliated with or endorsed by Electronic Arts. *Need for
 Speed* and *Need for Speed: Underground 2* are trademarks of Electronic Arts

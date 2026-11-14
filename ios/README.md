@@ -11,10 +11,11 @@ As with the main project: **no game code or assets are in this repository.** You
 need your own copy of the game; the lifted C (`gen/`) and every build (`out/`)
 stay out of git.
 
-## Status (2026-11-07)
+## Status (2026-11-14)
 
-**The full game runs on the iPad mini 2**: boot, front end, menus, Quick Race,
-with sound, touch controls and the original rendering.
+**The full game runs on the iPad mini 2**: boot, movies, front end, career mode (free
+roam, races, shops, saves) and Quick Race, with sound, touch controls and the original
+rendering.
 
 - On low graphics settings it holds a **stable 60 fps** (tested by playing on the
   device).
@@ -23,12 +24,19 @@ with sound, touch controls and the original rendering.
   ~1,200 draw calls per frame. That race is GPU-bound: GPU ~31 ms per frame,
   while the guest CPU thread waits ~12 ms per frame.
 - Title screen and menus: 60 fps (16.7 ms, vsync-locked).
-- Memory (phys_footprint, which jetsam enforces): **peak 376 MB** through a race and back
-  to the menu, down from 570 MB in the first iOS build (target: under 450 MB).
+- Memory (phys_footprint, which jetsam enforces): **peak 376–425 MB** in scripted
+  races, down from 570 MB in the first iOS build (target: under 450 MB). Long free-roam
+  sessions have reached ~490–500 MB (open-world DXT1 textures); being worked on.
 - **Movies play** (intro, PSA, opening FMV, story movies) with the game's own VP6
   decoder; tap to skip the movies the game allows to be skipped.
 - Music no longer stutters (fair GIL, see below); the iOS keyboard comes up for the
   profile name.
+- **Gear ▲/▼ keys** appear in drag races and with manual transmission (drag races were
+  unwinnable without them: the engine blows); **Map** and **SMS** keys while driving.
+- **Game data 1.7 GB** on the device instead of 2.2 GB (`ios/pack_data.py`, lossless);
+  loads are faster.
+- Car showroom loading hang: fixed (the game clock now keeps moving through long
+  loads, see `VCLOCK_LOADCAP` in `runtime/win32.c`); being verified on the device.
 
 More optimisation is on the way: 16-bit DXT1 textures, render-pass and bandwidth
 work for the tile-based GPU, and memory. The next device to test is the
@@ -51,6 +59,8 @@ work for the tile-based GPU, and memory. The next device to test is the
 | Movies | `SPEED2.EXE` has On2's VP6 decoder. It hung because EA's CPU-speed probe (`sub_006f5f14`) busy-waits 1 s of `QueryPerformanceCounter` time, which the virtual clock never delivers within a frame: QPC calls from its delay helper (return `0x006f5eab`, NA) get real time. The movie audio watchdog (`sub_007260f7`) rebuilds DirectSound when the cursor reads the same 100 times: `GetCurrentPosition` now moves smoothly between callbacks. A tap during a movie is Enter (the EA/THX/PSA screens are unskippable, as on the PC). |
 | Text entry | The `WM_CHAR` branch feeds the text box at `0x0083a7b0` while `byte[0x0083a9c0] && dword[0x0083a9c4]` (NA). `nfs_textbox_active()` is polled to show/hide the system keyboard; typed text goes to the `WM_CHAR` queue. |
 | Audio / GIL | The game's sound tick (a `timeSetEvent` callback) waited up to 250 ms for the GIL behind the main thread on 2 cores, so ~12 % of the music was muted. FIFO ticket GIL (`NFSU2_FAIRGIL`) + timer thread at user-interactive QoS: 0 ms muted. Smaller RemoteIO slice (256 frames) and a 100 ms write lead (`SNDLEAD_MS`). |
+| Driving keys | GEAR ▲ (under ENTER) and GEAR ▼ (under ESC) appear while driving in a drag race (byte `0x0089e7d8` / dword `0x00890108`, the flags that pick `HUD_Drag.fng`) or with manual transmission (player 1 byte `0x0083aa79` = 1); MAP and SMS (left of ENTER) while driving. They send the keys the game's active action map binds to Shift Up / Shift Down / WorldMap / SMS (defaults Left Shift or ', Left Ctrl, M, Tab), so remaps follow. `NFSU2_GEARKEYS=1` shows the gear keys whenever driving, `0` never. NA addresses. |
+| Data size | Optional NFZ1 compressed game files (`ios/pack_data.py`), read transparently by `fileio.c`: about 430 MB less on the device. |
 | Textures | Only DXT textures shed their guest copy after upload: the game re-locks A8R8G8B8 textures to recomposite car skins, rims and vinyls (shedding those removed the wheels). |
 
 ## Build and install
@@ -63,11 +73,23 @@ README, the **NA v1.2** `SPEED2.EXE`, and an SSH host alias for the device
 tools/gen_v2.sh                        # lift the NA exe into gen/na (see the main README)
 ios/build_ios.sh                       # shards + runtime -> out/ios/NFSU2.app (about 70 s on an M5)
 ios/build_ios.sh rt                    # runtime only (shards already built)
-ios/push_data.sh "<game folder>" ipadmini2   # resumable copy to /var/mobile/Media/NFSU2 (~1.8 GB, no MOVIES)
+python3 ios/pack_data.py "<game folder>"    # smaller copy of the data -> out/ios-data (lossless, ~2 s)
+ios/push_data.sh out/ios-data ipadmini2      # resumable copy to /var/mobile/Media/NFSU2 (~1.7 GB with movies)
 ios/install.sh ipadmini2               # staged install into /Applications, then uicache
 ssh ipadmini2 uiopen -b com.legacylab.nfsu2
 ```
 
+- `ios/pack_data.py` makes the data **about 430 MB smaller** (2.07 GB to 1.64 GB) without
+  changing it: files that compress well (track world data, car and wheel models,
+  front end, cutscene data, sound banks) are stored as NFZ1 (128 KB blocks, LZFSE from
+  Apple's libcompression); everything else is an APFS clone of the original. The game
+  folder is only read. The runtime (`runtime/fileio.c`, NFZ1) reads these files
+  transparently, so the game sees the original sizes and contents. Music, movies, car
+  vinyls and speech are already compressed and are left as they are. Every packed file
+  is checked to decompress to the original before it is written. The unpacked game
+  folder still works too.
+  On the iPad mini 2 a scripted race decompresses ~89 MB in 430 ms in total (spread
+  across the loads).
 - The app icon is generated at build time from `ICON=<square image>` (default
   `../nfsug2.jpg`, outside the repo). No logo is committed.
 - `out/ios/NFSU2.dSYM` symbolicates device crash reports:
