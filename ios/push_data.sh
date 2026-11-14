@@ -4,6 +4,9 @@
 # Skipped: SDATA_OLD, Support, Windows DLLs/EXEs
 # other than SPEED2.EXE. Game data: never commit it.
 # Usage: ios/push_data.sh "<game dir>" [ssh-host]     env IPAD_SSH_OPTS: extra ssh options
+# Recommended: push the smaller copy made by ios/pack_data.py instead of the game folder:
+#   python3 ios/pack_data.py "<game dir>" && ios/push_data.sh out/ios-data
+# (the install must be a build with NFZ1 support, see runtime/fileio.c)
 set -euo pipefail
 GAME="$1"; HOST="${2:-ipadmini2}"
 [[ -f "$GAME/SPEED2.EXE" && -d "$GAME/TRACKS" ]] || { echo "not a game dir: $GAME" >&2; exit 1; }

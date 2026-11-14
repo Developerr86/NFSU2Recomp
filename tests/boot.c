@@ -45,6 +45,24 @@ static void all_reports(void){
 }
 
 static void all_reports(void);
+/* All guest threads' call chains + the files opened last (a hang report).  Called by
+ * the ALARM timeout, and on iOS by a three-finger tap / the no-frame watchdog. */
+void nfs_dump_threads(const char *why){
+    extern void guest_backtrace(CPU*,int);
+    extern CPU *g_all_cpus[]; extern uint32_t g_all_tids[]; extern int g_all_n;
+    void fileio_recent_report(void);
+    fprintf(stderr,"\n*** THREAD DUMP (%s): import calls %llu, indirect %llu\n", why,
+            (unsigned long long)g_win32_calls, (unsigned long long)g_stat_indirect_ok);
+    fprintf(stderr,"    --- call chains of ALL guest threads (%d) ---\n", g_all_n);
+    for (int i = 0; i < g_all_n; i++){
+        if (!g_all_cpus[i]) continue;
+        fprintf(stderr,"    [thread %d  tid=%u  eip=0x%08x esp=0x%08x]\n",
+                i, g_all_tids[i], g_all_cpus[i]->eip, g_all_cpus[i]->esp);
+        guest_backtrace(g_all_cpus[i], 26);
+    }
+    fileio_recent_report();
+    fflush(stderr);
+}
 static void on_alarm(int s){ (void)s;
     fprintf(stderr,"\n*** TIMEOUT - the guest is still running (infinite loop or long work)\n");
     fprintf(stderr,"    import calls: %llu  indirect: %llu  traps: %llu\n",
@@ -52,15 +70,7 @@ static void on_alarm(int s){ (void)s;
       (unsigned long long)g_stat_unsupported);
     /* The direct answer to "where did it get stuck?": the call chain of the guest
      * thread running at that moment. */
-    { extern void guest_backtrace(CPU*,int);
-      extern CPU *g_all_cpus[]; extern uint32_t g_all_tids[]; extern int g_all_n;
-      fprintf(stderr,"    --- call chains of ALL guest threads (%d) ---\n", g_all_n);
-      for (int i = 0; i < g_all_n; i++){
-          if (!g_all_cpus[i]) continue;
-          fprintf(stderr,"    [thread %d  tid=%u  esp=0x%08x]\n",
-                  i, g_all_tids[i], g_all_cpus[i]->esp);
-          guest_backtrace(g_all_cpus[i], 26);
-      } }
+    nfs_dump_threads("timeout");
     all_reports();
     /* In the PGO measurement build the profile is written with atexit, and _exit
      * skips it.  We look the symbol up with dlsym: a weak declaration still gives

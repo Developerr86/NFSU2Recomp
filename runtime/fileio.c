@@ -19,6 +19,95 @@ static uint64_t now_ns_io(void){
 
 void mem_commit(uint32_t,uint32_t);
 
+/* --- NFZ1: compressed game files (ios/pack_data.py) ------------------------
+ * ios/pack_data.py stores the game files that compress well (track world data, car
+ * and wheel models, front end ...) as NFZ1: a header, a table of block offsets and
+ * blocks of BLOCK bytes compressed with Apple's libcompression (LZFSE); a block
+ * stored at its original length is raw.  Same names as the originals; the game sees
+ * the original size and contents (GetFileSize, find data, reads at any offset).
+ * Saves ~500 MB of the ~2.2 GB on the device.  Reads decompress whole blocks: a
+ * block covered completely goes straight into guest memory, a partly read one
+ * through a one-block cache per handle.  Header: "NFZ1", u32 codec, u32 block
+ * size, u32 count, u64 original size, u32 offsets[count + 1]. */
+#include <compression.h>
+#include <pthread.h>
+typedef struct NZ {
+    int fd; uint32_t codec, bs, n; uint64_t size, pos; uint32_t *off;
+    uint8_t *cache; int64_t cidx;
+} NZ;
+static pthread_mutex_t g_nz_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *g_nz_tmp; static size_t g_nz_tmpsz;
+static void *g_nz_scratch; static uint32_t g_nz_scratch_codec;
+uint64_t g_nz_blocks = 0, g_nz_bytes = 0, g_nz_ns = 0;
+static int nz_head(int fd, uint32_t h[3], uint64_t *size){
+    unsigned char b[24];
+    if (pread(fd, b, 24, 0) != 24 || memcmp(b, "NFZ1", 4)) return 0;
+    memcpy(h, b + 4, 12); memcpy(size, b + 16, 8);
+    return h[1] >= 4096 && h[1] <= (16u << 20) && h[2] == (*size + h[1] - 1) / h[1];
+}
+static NZ *nz_open(int fd){
+    uint32_t h[3]; uint64_t size;
+    if (fd < 0 || !nz_head(fd, h, &size)) return 0;
+    NZ *z = calloc(1, sizeof *z); if (!z) return 0;
+    z->fd = fd; z->codec = h[0]; z->bs = h[1]; z->n = h[2]; z->size = size; z->cidx = -1;
+    size_t tb = 4u * ((size_t)z->n + 1);
+    z->off = malloc(tb);
+    if (!z->off || pread(fd, z->off, tb, 24) != (ssize_t)tb){ free(z->off); free(z); return 0; }
+    return z;
+}
+static void nz_close(NZ *z){ if (z){ free(z->off); free(z->cache); free(z); } }
+/* the original size of an NFZ1 file, else st_size */
+static uint64_t nz_file_size(const char *path, uint64_t st_size){
+    if (st_size < 24) return st_size;
+    int fd = open(path, O_RDONLY); if (fd < 0) return st_size;
+    uint32_t h[3]; uint64_t size;
+    if (!nz_head(fd, h, &size)) size = st_size;
+    close(fd); return size;
+}
+/* block b (want bytes) -> dst.  g_nz_mu held. */
+static int nz_block(NZ *z, uint32_t b, uint8_t *dst, size_t want){
+    uint32_t a = z->off[b], e = z->off[b + 1];
+    if (e < a || e - a > want) return 0;
+    size_t clen = e - a;
+    if (clen == want) return pread(z->fd, dst, want, a) == (ssize_t)want;
+    if (g_nz_tmpsz < clen){ free(g_nz_tmp); g_nz_tmp = malloc(clen); g_nz_tmpsz = g_nz_tmp ? clen : 0; if (!g_nz_tmp) return 0; }
+    if (!g_nz_scratch || g_nz_scratch_codec != z->codec){
+        free(g_nz_scratch); g_nz_scratch = malloc(compression_decode_scratch_buffer_size((compression_algorithm)z->codec) + 1);
+        g_nz_scratch_codec = z->codec; }
+    if (pread(z->fd, g_nz_tmp, clen, a) != (ssize_t)clen) return 0;
+    uint64_t t0 = now_ns_io();
+    size_t got = compression_decode_buffer(dst, want, g_nz_tmp, clen, g_nz_scratch, (compression_algorithm)z->codec);
+    g_nz_ns += now_ns_io() - t0; g_nz_blocks++; g_nz_bytes += want;
+    return got == want;
+}
+static ssize_t nz_pread(NZ *z, uint8_t *dst, size_t len, uint64_t off){
+    if (off >= z->size) return 0;
+    if (len > z->size - off) len = (size_t)(z->size - off);
+    pthread_mutex_lock(&g_nz_mu);
+    size_t done = 0;
+    while (done < len){
+        uint64_t p = off + done;
+        uint32_t b = (uint32_t)(p / z->bs);
+        size_t s = (size_t)(p - (uint64_t)b * z->bs);
+        size_t want = (size_t)((z->size - (uint64_t)b * z->bs) < z->bs ? z->size - (uint64_t)b * z->bs : z->bs);
+        size_t take = want - s < len - done ? want - s : len - done;
+        if (z->cidx == (int64_t)b) memcpy(dst + done, z->cache + s, take);
+        else if (s == 0 && take == want){
+            if (!nz_block(z, b, dst + done, want)) break;
+        } else {
+            if (!z->cache && !(z->cache = malloc(z->bs))) break;
+            z->cidx = -1;
+            if (!nz_block(z, b, z->cache, want)) break;
+            z->cidx = b;
+            memcpy(dst + done, z->cache + s, take);
+        }
+        done += take;
+    }
+    pthread_mutex_unlock(&g_nz_mu);
+    if (done < len) fprintf(stderr, "  [file] NFZ1 read error at offset %llu\n", (unsigned long long)(off + done));
+    return (ssize_t)done;
+}
+
 static char g_root[1024] = ".";
 static char g_cwd_rel[512] = "";           /* current directory inside the game */
 uint64_t g_file_open=0, g_file_fail=0, g_file_read=0, g_bytes_read=0;
@@ -124,6 +213,16 @@ static int resolve_w(const char *win, char *out, size_t outsz){
     return resolve_in(g_wroot[0] ? g_wroot : g_root, win, out, outsz);
 }
 static int copy_file(const char *a, const char *b){
+    { int fd = open(a, O_RDONLY); NZ *z = nz_open(fd);       /* NFZ1: copy the original contents */
+      if (z){
+          mkparents(b);
+          FILE *fb = fopen(b, "wb"); int ok = fb != 0;
+          uint8_t *buf = ok ? malloc(z->bs) : 0;
+          for (uint64_t o = 0; ok && buf && o < z->size; o += z->bs){
+              ssize_t k = nz_pread(z, buf, z->bs, o);
+              ok = k > 0 && fwrite(buf, 1, (size_t)k, fb) == (size_t)k; }
+          free(buf); if (fb) fclose(fb); nz_close(z); close(fd); return ok; }
+      if (fd >= 0) close(fd); }
     FILE *fa = fopen(a, "rb"); if (!fa) return 0;
     mkparents(b);
     FILE *fb = fopen(b, "wb"); if (!fb){ fclose(fa); return 0; }
@@ -154,7 +253,7 @@ int  fileio_movie_playing(void){ return atomic_load(&g_movie_open) > 0; }
 /* chunk map of an open movie (EA VP6 container: 4-byte tag + 4-byte LE size) and the
  * last reads (guest buffer <- file offset), see MOVIE SKIP */
 typedef struct { uint32_t *off; int n; struct { uint32_t buf, foff, len; } rd[16]; int nrd; uint64_t pos; } MovMap;
-typedef struct { int fd; int empty; int used; int movie; MovMap *mm; char path[512]; DIR *dir; char pat[128];
+typedef struct { int fd; int empty; int used; int movie; MovMap *mm; NZ *nz; char path[512]; DIR *dir; char pat[128];
                  DIR *dir2; char path1[512]; } FH;   /* dir2: the game root (while the save layer is active) */
 static FH g_fh[FH_MAX];
 static uint32_t fh_new(void){
@@ -167,6 +266,23 @@ static FH *fh_get(uint32_t h){
     FH *f=&g_fh[h-FH_BASE]; return f->used?f:0;
 }
 int fileio_is_handle(uint32_t h){ return fh_get(h)!=0; }
+
+/* the last files opened (for hang reports: what was the game loading?) */
+#define RECENT_N 16
+static char g_recent[RECENT_N][160]; static unsigned g_recent_n;
+static void recent_note(const char *path, const char *how){
+    const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+    char d[64] = ""; { const char *q = bn - 1; int depth = 0;   /* keep one parent dir */
+        while (q > path && depth < 2){ q--; if (*q == '/') depth++; }
+        if (q > path) snprintf(d, sizeof d, "%.*s", (int)(bn - q - 1), q + 1); }
+    snprintf(g_recent[g_recent_n % RECENT_N], sizeof g_recent[0], "%s %s%s%s", how, d, *d ? "/" : "", bn);
+    g_recent_n++;
+}
+void fileio_recent_report(void){
+    unsigned n = g_recent_n < RECENT_N ? g_recent_n : RECENT_N;
+    fprintf(stderr,"    --- last %u files opened ---\n", n);
+    for (unsigned k = g_recent_n - n; k < g_recent_n; k++) fprintf(stderr,"      %s\n", g_recent[k % RECENT_N]);
+}
 
 /* MOVIE SKIP, data side: rewrite the tag of every chunk in [foff, foff+len) that sits
  * in guest buffer buf to "SCEl" (end of stream), so the player's next parse ends the
@@ -261,8 +377,9 @@ static void fill_find_data(uint32_t fd_, const char *full, const char *nm){
     if (stat(full, &st) == 0){
         if (S_ISDIR(st.st_mode)) attr = 0x10u;      /* FILE_ATTRIBUTE_DIRECTORY */
         else {
-            MR32(fd_+28) = (uint32_t)((uint64_t)st.st_size >> 32);
-            MR32(fd_+32) = (uint32_t)st.st_size;
+            uint64_t sz = nz_file_size(full, (uint64_t)st.st_size);
+            MR32(fd_+28) = (uint32_t)(sz >> 32);
+            MR32(fd_+32) = (uint32_t)sz;
         }
         /* Unix seconds -> FILETIME (100 ns since 1601) */
         uint64_t ft = ((uint64_t)st.st_mtime + 11644473600ull) * 10000000ull;
@@ -363,6 +480,8 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
             if(!h){ close(fd); r=INVALID_HANDLE; }
             else { FH*f=fh_get(h); f->fd=fd; f->empty = g_empty_next; g_empty_next = 0;
                    snprintf(f->path,sizeof f->path,"%s",real);
+                   if (flags == O_RDONLY) f->nz = nz_open(fd);          /* see NFZ1 */
+                   recent_note(real, flags == O_RDONLY ? "read " : "write");
                    { const char *ext3 = strrchr(real, '.'), *bn3 = strrchr(real, '/');
                      bn3 = bn3 ? bn3 + 1 : real;
                      f->movie = (ext3 && !strcasecmp(ext3, ".vp6") && strncasecmp(bn3, "blank", 5)) ? 1 : 0;
@@ -383,7 +502,7 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
                uint64_t _rd0 = now_ns_io();
                if (ov && mem_is_committed(ov+19)){
                    uint64_t off = (uint64_t)MR32(ov+8) | ((uint64_t)MR32(ov+12) << 32);
-                   got = pread(f->fd, g_mem+buf, len, (off_t)off);
+                   got = f->nz ? nz_pread(f->nz, g_mem+buf, len, off) : pread(f->fd, g_mem+buf, len, (off_t)off);
                    if(got<0) got=0;
                    if (f->movie) mov_note_read(f, buf, off, got);             /* see MOVIE SKIP */
                    MR32(ov+0) = 0;                      /* Internal = STATUS_SUCCESS */
@@ -400,6 +519,10 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
                    g_overlapped_reads++;
                } else if (f->empty){
                    got = 0;                       /* immediate end of file */
+               } else if (f->nz){
+                   got = nz_pread(f->nz, g_mem+buf, len, f->nz->pos);
+                   if (got < 0) got = 0;
+                   f->nz->pos += (uint64_t)got;
                } else {
                    off_t pos0 = f->movie ? lseek(f->fd, 0, SEEK_CUR) : 0;
                    got = read(f->fd, g_mem+buf, len);
@@ -448,6 +571,10 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"SetFilePointer")){
         FH*f=fh_get(A(c,0)); int32_t dist=(int32_t)A(c,1); uint32_t method=A(c,3);
         if(!f||f->fd<0) r=0xFFFFFFFFu;
+        else if (f->nz){
+            int64_t base = method==1 ? (int64_t)f->nz->pos : (method==2 ? (int64_t)f->nz->size : 0);
+            int64_t p = base + dist;
+            if (p < 0) r = 0xFFFFFFFFu; else { f->nz->pos = (uint64_t)p; r = (uint32_t)p; } }
         else { int wh = method==1?SEEK_CUR : (method==2?SEEK_END:SEEK_SET);
                off_t p = lseek(f->fd, dist, wh);
                r = (p<0)?0xFFFFFFFFu:(uint32_t)p; }
@@ -455,6 +582,7 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"GetFileSize")){
         FH*f=fh_get(A(c,0)); uint32_t ph=A(c,1);
         if(!f||f->fd<0) r=0xFFFFFFFFu;
+        else if (f->nz){ r = (uint32_t)f->nz->size; if(ph) MR32(ph)=(uint32_t)(f->nz->size >> 32); }
         else { struct stat st; if(fstat(f->fd,&st)==0){ r=(uint32_t)st.st_size;
                  if(ph) MR32(ph)=(uint32_t)(((uint64_t)st.st_size)>>32); } else r=0xFFFFFFFFu; }
     }
@@ -466,6 +594,7 @@ static int fileio_call_impl(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"CloseHandle")){
         FH*f=fh_get(A(c,0));
         if(!f) return 0;                       /* not ours - let the other layer look */
+        if (f->nz){ nz_close(f->nz); f->nz = 0; }
         if(f->fd>=0) close(f->fd);
         if(f->dir) closedir(f->dir);
         if (f->mm){ free(f->mm->off); free(f->mm); f->mm = 0; }
@@ -563,4 +692,7 @@ void fileio_report(void){
     fprintf(stderr,"  file: %llu opened, %llu could not be opened, %llu reads, %.1f MB\n",
             (unsigned long long)g_file_open,(unsigned long long)g_file_fail,
             (unsigned long long)g_file_read,(double)g_bytes_read/1048576.0);
+    if (g_nz_blocks)
+        fprintf(stderr,"  file: NFZ1 %llu blocks decompressed, %.1f MB in %.0f ms\n",
+                (unsigned long long)g_nz_blocks, (double)g_nz_bytes/1048576.0, (double)g_nz_ns/1e6);
 }

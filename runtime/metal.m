@@ -44,8 +44,23 @@ static CAMetalLayer    *g_layer;
 static _Atomic int      g_ios_paused;
 void metal_ios_attach_layer(CAMetalLayer *l){ g_layer = l; }
 void metal_ios_set_paused(int p){ atomic_store(&g_ios_paused, p ? 1 : 0); }
+int  metal_ios_is_paused(void){ return atomic_load(&g_ios_paused); }
 #endif
 static long             g_skip_empty;   /* a frame with no content: don't present */
+static unsigned long long g_pt_pass, g_pt_cload, g_pt_big, g_pt_zpass, g_pt_zload;   /* PASS TRAFFIC */
+/* PASSCB=<a>,<b> (diagnostic, works on iOS where counter sampling doesn't): in frames a..b
+ * every render pass gets its own command buffer; its GPU time is added per pass index
+ * (target size, colour load) and reported at exit. */
+#define PCBN 48
+static struct { unsigned w, h, cload, zl; double ms; unsigned long n;
+                unsigned long frames, draws, at, zw, bl, opq_after_at; } g_pcb[PCBN];
+static pthread_mutex_t g_pcb_mx = PTHREAD_MUTEX_INITIALIZER;
+static long g_pcb_a = -1, g_pcb_b = -1;
+static int pcb_frame(long f){
+    if (g_pcb_a < 0){ g_pcb_a = 0; const char *e = getenv("PASSCB");
+        if (e && *e){ long a = 0, b = 0; if (sscanf(e, "%ld,%ld", &a, &b) == 2 && b > a){ g_pcb_a = a; g_pcb_b = b; } } }
+    return g_pcb_b > 0 && f >= g_pcb_a && f <= g_pcb_b;
+}
 static id<MTLTexture>   g_capture;   /* readable copy for frame capture */
 
 /* --- frame dump: DUMPFRAME=100,300 writes the selected frames as PNG --------
@@ -363,6 +378,7 @@ void metal_fill_keyboard(unsigned char *dst, unsigned n){
 /* Textures are created BEFORE the window opens.  So the "usable" criterion is the
  * device, not the layer; otherwise early textures silently vanished. */
 int  metal_available(void){ return g_dev != nil; }
+long metal_frames_drawn(void){ return atomic_load(&g_frames_drawn); }
 int  metal_window_ready(void){ return g_layer != nil; }
 
 long metal_frames(void){ return atomic_load(&g_frames_drawn); }
@@ -3941,6 +3957,55 @@ static void pass_reorder(int rb){
         a = c - 1;
     }
 }
+/* ---- CUTOUTS LAST (tile-based GPUs) ------------------------------------------------
+ * A fragment shader with discard (alpha-tested cutouts: foliage, fences, decals) costs
+ * PowerVR's hidden surface removal for what was submitted before it in the tile; the
+ * race scene interleaves them: 650 draws, 65 alpha-tested, 170 opaque Z-writing draws
+ * after the first cutout (PASSCB content, Mac race).  Within a run of draws that are
+ * NOT blended, depth-tested with Less/LessEqual and depth-writing, on the same target
+ * and Z surface, opaque draws are moved before the cutouts (stable: each group keeps
+ * its order).  With the depth test the image is the same except for exactly coplanar
+ * surfaces.  Anything else (blended draw, clear, blit, upload, Z-write off, other
+ * target) is a barrier.  OpenUG2 on the same GPU: GPU 30.5 -> 11.4 ms from removing
+ * discard.  NFSU2_CUTLAST=1 (default off until measured on the iPad). */
+static _Atomic unsigned long long g_cut_moved, g_cut_runs;
+static int cutlast_on(void){
+    static int v = -1;
+    /* off by default until measured on the device (NFSU2_CUTLAST=1 turns it on) */
+    if (v < 0){ const char *e = ENVC("NFSU2_CUTLAST"); v = (e && *e == '1'); }
+    return v;
+}
+static int cut_movable(const MDraw *x){
+    if (x->is_clear || x->is_blit || x->is_up || (x->blend & 1u)) return 0;
+    unsigned d = x->depth & 63u, f = (d >> 2) & 7u;
+    return (d & 1u) && (d & 2u) && (f == 2u || f == 4u);
+}
+static void cutout_last(int rb){
+    if (!cutlast_on()) return;
+    unsigned n = g_dn[rb]; MDraw *D = g_dbuf[rb];
+    static MDraw *tmp; static unsigned tcap;
+    unsigned a = 0;
+    while (a < n){
+        if (!cut_movable(&D[a])){ a++; continue; }
+        unsigned T = D[a].target, Z = DEPTH_ZID(D[a].depth), b = a, nat = 0, first_at = 0xFFFFFFFFu, opq_after = 0;
+        while (b < n && cut_movable(&D[b]) && D[b].target == T && DEPTH_ZID(D[b].depth) == Z){
+            if (D[b].alpha_ref > 0.f){ nat++; if (first_at == 0xFFFFFFFFu) first_at = b; }
+            else if (first_at != 0xFFFFFFFFu) opq_after++;
+            b++;
+        }
+        if (nat && opq_after){
+            unsigned len = b - a, o = 0;
+            if (len > tcap){ free(tmp); tmp = malloc(sizeof(MDraw) * len); tcap = tmp ? len : 0; }
+            if (tmp){
+                for (unsigned q = a; q < b; q++) if (!(D[q].alpha_ref > 0.f)) tmp[o++] = D[q];
+                for (unsigned q = a; q < b; q++) if (  D[q].alpha_ref > 0.f ) tmp[o++] = D[q];
+                memcpy(&D[a], tmp, sizeof(MDraw) * len);
+                atomic_fetch_add(&g_cut_moved, opq_after); atomic_fetch_add(&g_cut_runs, 1ull);
+            }
+        }
+        a = b;
+    }
+}
 /* 1 if the draw at i would open a pass with only a Clear on the screen: the first
  * real work after it is on another target, and the screen gets drawn to again
  * before it is read. */
@@ -6683,6 +6748,7 @@ void metal_run_main_loop(void){
                     if (dtex){
                         struct timespec _e0; clock_gettime(CLOCK_MONOTONIC,&_e0);
                         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+                        int pcb_on = pcb_frame(atomic_load(&g_frames_drawn) + 1), pcb_k = 0;   /* see PASSCB */
                         pp_begin(atomic_load(&g_frames_drawn) + 1);
                         int ab_count = 0;
                         g_ab_mode = ab_frame(atomic_load(&g_frames_drawn) + 1, &ab_count);
@@ -6745,6 +6811,7 @@ void metal_run_main_loop(void){
                         unsigned c_att = 0;             /* (HD) resolve target bound to the pass: bit0 color, bit1 G */
                         (void)hd_post; (void)c_att;
                         if (rb >= 0) pass_reorder(rb);  /* defer the intermediate pass splitting the scene (see PASS MERGING) */
+                        if (rb >= 0) cutout_last(rb);   /* see CUTOUTS LAST */
                         /* see SCREEN REDIRECTION: screen records up to scr_b are drawn into scr_T */
                         unsigned scr_T = 0; int scr_after = 0;
                         long scr_b = rb >= 0 ? scr_redirect_plan(rb, dtex, &scr_T) : -1;
@@ -7412,6 +7479,9 @@ void metal_run_main_loop(void){
                                       if (!dr->target && scr_after == 1){ scr_after = 2;
                                           if (scrredir_mode() == 2 && do_clear) rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 1, 1); } }
                                     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                                    /* PASS TRAFFIC counters (report): tile loads/stores per frame */
+                                    g_pt_pass++; if (rp.colorAttachments[0].loadAction == MTLLoadActionLoad) g_pt_cload++;
+                                    if (tgt.width * tgt.height >= 512u * 384u) g_pt_big++;
                                     c_ms = 0;
 #if NFS_ENHANCED
                                     int c_ml = 0;                   /* see MEMORYLESS MSAA ATTACHMENTS */
@@ -7567,6 +7637,7 @@ void metal_run_main_loop(void){
                                         rp.depthAttachment.loadAction = zclear ? MTLLoadActionClear : MTLLoadActionLoad;
                                         rp.depthAttachment.storeAction = MTLStoreActionStore;
                                         rp.depthAttachment.clearDepth = zval;
+                                        g_pt_zpass++; if (!zclear) g_pt_zload++;
 #if NFS_ENHANCED
                                         /* RESOLVE the MSAA depth into the single-sampled twin: passes drawing into a
                                          * single-sampled target with the same Z after the screen
@@ -7630,6 +7701,30 @@ void metal_run_main_loop(void){
                                                   nd++; if (x->depth & 2u) nz++; if (x->depth & 1u) nzt++; if (x->alpha_ref > 0.f) na++; }
                                               fprintf(stderr, "  [content] draw#%u %s: zid %u, %u draws, Z writing %u, Z testing %u, alpha tested %u, first ps %d tex %u\n",
                                                       i, pn, zz, nd, nz, nzt, na, dr->ps, dr->tex); } } }
+                                    if (pcb_on){                   /* see PASSCB */
+                                        if (pcb_k > 0){ [cb commit]; cb = [g_queue commandBuffer]; }
+                                        int k = pcb_k < PCBN ? pcb_k : PCBN - 1;
+                                        unsigned pw = (unsigned)rp.colorAttachments[0].texture.width, ph = (unsigned)rp.colorAttachments[0].texture.height;
+                                        int cl = rp.colorAttachments[0].loadAction == MTLLoadActionLoad;
+                                        int zl = rp.depthAttachment.texture && rp.depthAttachment.loadAction == MTLLoadActionLoad;
+                                        { unsigned zz = DEPTH_ZID(dr->depth); int seen_at = 0;   /* pass content */
+                                          for (unsigned q = i; q < g_dn[rb]; q++){ const MDraw *x = &g_dbuf[rb][q];
+                                              if (x->is_blit || x->target != dr->target || DEPTH_ZID(x->depth) != zz) break;
+                                              if (x->is_clear || x->is_up) continue;
+                                              int at = x->alpha_ref > 0.f, bl = x->blend & 1u, zw = (x->depth & 2u) != 0;
+                                              g_pcb[k].draws++; g_pcb[k].at += at; g_pcb[k].bl += bl; g_pcb[k].zw += zw;
+                                              if (at && !bl) seen_at = 1;
+                                              else if (seen_at && !bl && zw) g_pcb[k].opq_after_at++; }
+                                          g_pcb[k].frames++; }
+                                        [cb addCompletedHandler:^(id<MTLCommandBuffer> b){
+                                            double ms = (b.GPUEndTime - b.GPUStartTime) * 1e3;
+                                            if (ms <= 0.0 || ms > 1000.0) return;
+                                            pthread_mutex_lock(&g_pcb_mx);
+                                            g_pcb[k].w = pw; g_pcb[k].h = ph; g_pcb[k].cload += cl; g_pcb[k].zl += zl;
+                                            g_pcb[k].ms += ms; g_pcb[k].n++;
+                                            pthread_mutex_unlock(&g_pcb_mx); }];
+                                        pcb_k++;
+                                    }
                                     enc = [cb renderCommandEncoderWithDescriptor:rp];
                                     atomic_fetch_add(&g_pass_n, 1ull);
                                     if (g_atdbg) [enc setFragmentBuffer:g_atdbg offset:0 atIndex:6];   /* ALFAVAR diagnostic */
@@ -7985,6 +8080,22 @@ void metal_run_main_loop(void){
         ks_engel(0);
         if (g_ks_fd >= 0){ close(g_ks_fd); g_ks_fd = -1; }
         fprintf(stderr, "metal: empty frames skipped = %ld\n", g_skip_empty);
+        fprintf(stderr, "metal: cutouts last: %s, %llu runs reordered, %llu opaque draws moved ahead of cutouts\n",
+                cutlast_on() ? "on" : "off", (unsigned long long)g_cut_runs, (unsigned long long)g_cut_moved);
+        if (g_pcb_b > 0){ double tot = 0;
+            fprintf(stderr, "metal: PASSCB frames %ld-%ld, GPU time per pass index:\n", g_pcb_a, g_pcb_b);
+            for (int k = 0; k < PCBN; k++) if (g_pcb[k].n){
+                double m = g_pcb[k].ms / g_pcb[k].n; tot += m;
+                double fr = g_pcb[k].frames ? (double)g_pcb[k].frames : 1.0;
+                fprintf(stderr, "    pass %2d  %4ux%-4u  %6.2f ms  (%lu frames, colour load %lu, depth load %lu)  "
+                        "draws %.0f: alpha-tested %.0f, blended %.0f, Z-writing %.0f, opaque after the first cutout %.0f\n",
+                        k, g_pcb[k].w, g_pcb[k].h, m, g_pcb[k].n, g_pcb[k].cload, g_pcb[k].zl,
+                        g_pcb[k].draws / fr, g_pcb[k].at / fr, g_pcb[k].bl / fr, g_pcb[k].zw / fr, g_pcb[k].opq_after_at / fr); }
+            fprintf(stderr, "    sum of pass means %.2f ms\n", tot); }
+        { double fr = (double)(atomic_load(&g_frames_drawn) ? atomic_load(&g_frames_drawn) : 1);
+          fprintf(stderr, "metal: pass traffic per frame: %.1f passes (%.1f on targets >= 512x384), %.1f colour loads, "
+                  "%.1f with depth (%.1f depth loads, all depth stored)\n",
+                  g_pt_pass / fr, g_pt_big / fr, g_pt_cload / fr, g_pt_zpass / fr, g_pt_zload / fr); }
         fprintf(stderr, "metal: buffer ring: in %lu frames the previous frame was still on the GPU "
                 "(a single buffer would have been overwritten), waited for an empty set %lu times (total %.1f ms)\n",
                 atomic_load(&g_fb_overlap), atomic_load(&g_fb_wait),

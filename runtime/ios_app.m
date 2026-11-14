@@ -153,6 +153,12 @@ void metal_ios_char(unsigned char ch);
 - (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { (void)e; if (!downCount) [self set:1]; downCount += (int)t.count; }
 - (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { (void)e; downCount -= (int)t.count; if (downCount <= 0){ downCount = 0; [self set:0]; } }
 - (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self touchesEnded:t withEvent:e]; }
+/* show / hide (releasing a held key first); k != 0 re-targets the key */
+- (void)show:(BOOL)on dik:(unsigned char)k {
+    if (!on && !self.hidden && downCount){ downCount = 0; [self set:0]; }
+    if (k && k != _dik && !downCount) _dik = k;
+    self.hidden = !on;
+}
 @end
 
 /* The pad covers the whole screen; touches that miss a key fall through to the
@@ -165,12 +171,46 @@ void metal_ios_char(unsigned char ch);
 }
 @end
 
+void nfs_dump_threads(const char *why);
 @interface NfsVC : UIViewController @end
-@implementation NfsVC { UIView *pad; NfsKeyInput *keys; }
+@implementation NfsVC { UIView *pad; NfsKeyInput *keys; UILabel *note; NfsKey *gearUp, *gearDn, *mapKey, *smsKey; }
+/* three-finger tap: write a hang report (all guest threads' call chains + last files) */
+- (void)dumpTap:(UITapGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateEnded) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ nfs_dump_threads("three-finger tap"); });
+    if (!note){
+        note = [[UILabel alloc] initWithFrame:CGRectMake(0, 70, self.view.bounds.size.width, 40)];
+        note.textAlignment = NSTextAlignmentCenter; note.textColor = [UIColor whiteColor];
+        note.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6]; note.font = [UIFont boldSystemFontOfSize:18];
+        note.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        [self.view addSubview:note];
+    }
+    note.text = @"Diagnostics saved to nfsu2.log"; note.hidden = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ self->note.hidden = YES; });
+}
 - (void)pollTextBox {
     int on = nfs_textbox_active();
     if (on && !keys.isFirstResponder) [keys becomeFirstResponder];
     else if (!on && keys.isFirstResponder) [keys resignFirstResponder];
+    [self pollDriveKeys];
+}
+/* DRIVING KEYS: GEAR ▲ / GEAR ▼ only while driving in a drag race or with manual
+ * transmission; MAP and SMS while driving (race / free roam).  The keys send whatever
+ * the game's active map binds (com.c nfs_drive_keys).  NFSU2_GEARKEYS=1: gear keys
+ * whenever driving, 0: never. */
+- (void)pollDriveKeys {
+    int nfs_drive_keys(unsigned char dik[4]);
+    unsigned char k[4];
+    int st = nfs_drive_keys(k);
+    const char *e = getenv("NFSU2_GEARKEYS");
+    int gears = (st & 1) && ((st & 2) || (e && *e == '1')) && !(e && *e == '0');
+    static int last = -1;
+    if (st != last){ last = st; fprintf(stderr, "[ios] driving keys: driving=%d gears=%d (keys 0x%02x 0x%02x 0x%02x 0x%02x)\n",
+                                       st & 1, gears, k[0], k[1], k[2], k[3]); }
+    [gearUp show:gears && k[0] dik:env_key("NFSU2_KEY_SHIFTUP", k[0])];
+    [gearDn show:gears && k[1] dik:env_key("NFSU2_KEY_SHIFTDOWN", k[1])];
+    [mapKey show:(st & 1) && k[2] dik:env_key("NFSU2_KEY_MAP", k[2])];
+    [smsKey show:(st & 1) && k[3] dik:env_key("NFSU2_KEY_SMS", k[3])];
 }
 - (void)loadView {
     NfsView *v = [[NfsView alloc] initWithFrame:[UIScreen mainScreen].bounds];
@@ -181,10 +221,11 @@ void metal_ios_char(unsigned char ch);
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
-- (void)addKey:(NSString *)t dik:(unsigned char)k frame:(CGRect)f to:(UIView *)p mask:(UIViewAutoresizing)m {
+- (NfsKey *)addKey:(NSString *)t dik:(unsigned char)k frame:(CGRect)f to:(UIView *)p mask:(UIViewAutoresizing)m {
     NfsKey *b = [[NfsKey alloc] initWithFrame:f title:t dik:k];
     b.autoresizingMask = m;
     [p addSubview:b];
+    return b;
 }
 - (void)buildControls:(CGSize)S {
     pad = [[NfsPad alloc] initWithFrame:CGRectMake(0, 0, S.width, S.height)];
@@ -207,8 +248,18 @@ void metal_ios_char(unsigned char ch);
     [self addKey:@"ESC"   dik:env_key("NFSU2_KEY_ESC", 0x01)   frame:CGRectMake(g, g, 80, 54) to:pad mask:TL];
     [self addKey:@"ENTER" dik:env_key("NFSU2_KEY_ENTER", 0x1C) frame:CGRectMake(W - 110 - g, g, 110, 54) to:pad mask:TR];
     [self addKey:@"▼" dik:env_key("NFSU2_KEY_DOWN", 0xD0)  frame:CGRectMake(g * 2 + 80, g, 70, 54) to:pad mask:TL];
+    /* driving keys (shown by pollDriveKeys): gear down under ESC, gear up under ENTER,
+     * SMS and MAP to the left of ENTER */
+    gearDn = [self addKey:@"GEAR ▼" dik:0x1D frame:CGRectMake(g, g * 2 + 54, 110, 84) to:pad mask:TL];
+    gearUp = [self addKey:@"GEAR ▲" dik:0x2A frame:CGRectMake(W - 110 - g, g * 2 + 54, 110, 84) to:pad mask:TR];
+    smsKey = [self addKey:@"SMS" dik:0x0F frame:CGRectMake(W - 110 - g - (80 + g), g, 80, 54) to:pad mask:TR];
+    mapKey = [self addKey:@"MAP" dik:0x32 frame:CGRectMake(W - 110 - g - 2 * (80 + g), g, 80, 54) to:pad mask:TR];
+    gearDn.hidden = gearUp.hidden = smsKey.hidden = mapKey.hidden = YES;
     pad.hidden = getenv("NFSU2_NOPAD") && getenv("NFSU2_NOPAD")[0] == '1';
     [self.view addSubview:pad];
+    { UITapGestureRecognizer *t3 = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dumpTap:)];
+      t3.numberOfTouchesRequired = 3; t3.cancelsTouchesInView = NO;
+      [self.view addGestureRecognizer:t3]; }
     keys = [[NfsKeyInput alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
     [self.view addSubview:keys];
     [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(pollTextBox) userInfo:nil repeats:YES];
@@ -237,6 +288,15 @@ static void *mem_thread(void *arg){
                     metal_tex_kind_bytes(3) >> 20, metal_tex_kind_bytes(5) >> 20,
                     g_battery * 100.0f, g_charging ? " charging" : "");
         }
+        /* no-frame watchdog: 20 s without a presented frame while in the foreground ->
+         * one hang report (a stuck loading screen that still animates needs the
+         * three-finger tap instead) */
+        { long metal_frames_drawn(void); int metal_ios_is_paused(void);
+          static long last_f = -1; static int idle = 0, dumped = 0;
+          long f = metal_frames_drawn();
+          if (f > 0 && f == last_f && !metal_ios_is_paused()){ idle += 5; if (idle >= 20 && !dumped){ dumped = 1; nfs_dump_threads("no frame for 20 s"); } }
+          else { idle = 0; if (f != last_f) dumped = 0; }
+          last_f = f; }
         if (g_battery >= 0.0f && (g_battery < 0.05f || (g_battery < 0.08f && !g_charging))){
             fprintf(stderr, "[ios] BATTERY GUARD EXIT: %.0f%%%s\n", g_battery * 100.0f,
                     g_charging ? " (charging, still too low)" : " and not charging");

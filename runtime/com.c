@@ -500,6 +500,41 @@ static uint32_t g_act_of_key[256];      /* DIK -> uAppData (0 = not bound) */
 static uint32_t g_act_ofs[256];         /* DIK -> offset in the action array */
 static int      g_act_count = 0;
 static unsigned char g_kb_prev[256];
+
+/* ---- DRIVING KEYS for the iOS shell (on-screen gear / map / SMS keys) ----------------
+ * The game's keyboard action table (NA 0x007fcc00, DIACTION with names) has Shift Up = 7
+ * (Left Shift, '), Shift Down = 8 (Left Ctrl, .), WorldMap = 0x10 (M, F2), SMS = 0x11
+ * (Tab, F3); only the driving map (race and free roam) binds them.  dik[0..3] get the
+ * key the ACTIVE map binds to each action (so a remap in the game's options follows),
+ * 0 if none.  Returns 0 outside the driving map; bit 0 = driving map active, bit 1 =
+ * gear keys needed:
+ *   - drag race: the HUD constructor (0x005f1670) picks HUD_Drag.fng when byte
+ *     [0x0089e7d8] or dword [0x00890108] is set, and the pause menu (0x004c4740) hides
+ *     the Transmission option on the same test (drag races always shift by hand);
+ *   - manual transmission: player 1's setting byte [0x0083aa79] (stride 0x28 per player),
+ *     toggled by the Transmission option (0x004c3c70); 1 = "Manual" (0x004c3d80).
+ * NA addresses; on other builds the gear keys show whenever the driving map is active. */
+int nfs_drive_keys(unsigned char dik[4]){
+    static const uint32_t act[4] = { 7u, 8u, 0x10u, 0x11u };
+    dik[0] = dik[1] = dik[2] = dik[3] = 0;
+    if (!g_act_count) return 0;
+    for (int k = 1; k < 256; k++){
+        uint32_t a = g_act_of_key[k];
+        for (int i = 0; i < 4; i++) if (!dik[i] && a == act[i]) dik[i] = (unsigned char)k;
+    }
+    if (!dik[0] && !dik[1]) return 0;
+    int st = 1;
+#if defined(NFS_EXE_NA) && NFS_EXE_NA
+    if (g_mem && mem_is_committed(0x0089e7d8u) && mem_is_committed(0x0089010bu) && mem_is_committed(0x0083aa79u)){
+        int drag = MR8(0x0089e7d8u) || MR32(0x00890108u);
+        int manual = MR8(0x0083aa79u) == 1;
+        if (drag || manual) st |= 2;
+    }
+#else
+    st |= 2;
+#endif
+    return st;
+}
 static uint32_t g_relatch_at[256];      /* KEY RELATCH: re-press due (ms), 0 = none */
 static uint32_t g_di_seq = 1;
 static uint64_t g_di_events = 0;
@@ -3232,6 +3267,11 @@ int com_call(CPU *c, uint32_t magic){
                           g_present_no); }
               }
             g_present++;
+            if (ENVC("DRIVEKEYSLOG")){              /* test: log nfs_drive_keys changes (see DRIVING KEYS) */
+                static int last = -1; unsigned char dk[4]; int st = nfs_drive_keys(dk);
+                if (st != last){ last = st;
+                    fprintf(stderr, "  [drivekeys] frame %u: state %d (drag %u/%u, transmission %u) keys 0x%02x 0x%02x 0x%02x 0x%02x\n",
+                            g_present_no, st, MR8(0x0089e7d8u), MR32(0x00890108u), MR8(0x0083aa79u), dk[0], dk[1], dk[2], dk[3]); } }
             { void vclock_tick(void); vclock_tick(); }
             /* Since game speed = real fps / 60, throttle the frame to 60 Hz
              * (DEFAULT: NO limiter; locked to 60 Hz with PACE60=1). */

@@ -169,8 +169,19 @@ uint64_t host_us(void){
     uint64_t stalled = (now > rb) ? (now - rb) : 0ull;      /* unclamped */
     /* Safety valve: threshold 200 ms -> 60 ms, step 2 ms -> 4 ms.  Since the
      * ceiling was raised, this path now only runs on REAL stalls. */
+    /* LONG LOADS: inside a frame stalled for more than 500 ms (a load, not a slow
+     * frame) the creep may keep flowing, up to 10 s.  With the 200 ms cap game time
+     * froze during long loads, and any "wait N ms" loop the game runs there spun
+     * forever: on the iPad mini 2 the car showroom (shop scene load + Scene05 movie,
+     * then the movie object's destructor sub_0045a630 waits 20 ms via sub_0043bdf0)
+     * never finished; the Mac loads it fast enough to stay under the cap.  The creep
+     * becomes part of the base at the next frame, so time stays monotonic; only the
+     * frame after a long load sees a big step.  VCLOCK_LOADCAP=<us> (0 = old cap). */
     if (stalled > 60000ull && (n & 15u) == 15u){
-        if (atomic_load(&g_vclock_creep) < 200000ull)
+        static int64_t loadcap = -1;
+        if (loadcap < 0){ const char *e = ENVC("VCLOCK_LOADCAP"); loadcap = (e && *e) ? atoll(e) : 10000000ll; }
+        uint64_t cap = (stalled > 500000ull && loadcap > 200000) ? (uint64_t)loadcap : 200000ull;
+        if (atomic_load(&g_vclock_creep) < cap)
             atomic_fetch_add(&g_vclock_creep, 4000ull);
     }
     return base + d + atomic_load(&g_vclock_creep);

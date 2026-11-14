@@ -66,7 +66,7 @@ $CC $TGT -o "$APP/NFSU2" $OBJ/shard_*.o $OBJ/fntab.o $OBJ/stubs.o $RT \
     -Wl,-pagezero_size,0x4000 -Wl,-dead_strip \
     -lm -framework UIKit -framework Foundation -framework Metal -framework QuartzCore \
     -framework ImageIO -framework CoreGraphics -framework AudioToolbox -framework AVFoundation \
-    -framework GameController
+    -framework GameController -lcompression
 rm -rf out/ios/NFSU2.dSYM; dsymutil "$APP/NFSU2" -o out/ios/NFSU2.dSYM 2>/dev/null || true
 strip -S "$APP/NFSU2"
 cp ios/Info.plist "$APP/Info.plist"
